@@ -1035,6 +1035,34 @@ def run_streamlit_app() -> None:
 
     if run_scan_now:
         try:
+            # Persist the currently visible sidebar values before running,
+            # so the scan uses exactly what the user sees in the UI.
+            parsed_universe = [x.strip().upper() for x in universe_text.split(",") if x.strip()]
+            settings.update({
+                "investable_amount": float(investable_amount),
+                "benchmark": benchmark,
+                "user_universe": parsed_universe,
+                "position_mode": position_mode,
+                "max_new_positions_per_day": int(max_new_positions_per_day),
+                "min_cash_buffer_pct": float(min_cash_buffer_pct),
+                "strict_lightyear_only": bool(strict_lightyear_only),
+                "leadlag_enabled": bool(leadlag_enabled),
+                "auto_scan_enabled": bool(auto_scan_enabled),
+                "scheduled_hour": int(scheduled_hour),
+                "scheduled_minute": int(scheduled_minute),
+                "scheduled_timezone": scheduled_timezone,
+                "notifications_enabled": bool(notifications_enabled),
+                "notification_channel": notification_channel,
+                "telegram_bot_token": telegram_bot_token,
+                "telegram_chat_id": telegram_chat_id,
+                "smtp_host": smtp_host,
+                "smtp_port": int(smtp_port),
+                "smtp_username": smtp_username,
+                "smtp_password": smtp_password,
+                "smtp_to": smtp_to,
+            })
+            save_settings(settings)
+
             result = execute_daily_job()
             regime = result["regime"]
             signals = result["signals"]
