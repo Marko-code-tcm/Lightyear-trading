@@ -1,63 +1,10 @@
 #!/usr/bin/env python3
-"""
-Portfolio Signal Dashboard (Lightyear-aware)
-
-Features
---------
-- Streamlit dashboard for a model portfolio
-- Investable capital input
-- Daily BUY / HOLD / SELL proposals
-- One-click acceptance of proposals into portfolio state
-- Persistent local state in JSON/CSV files
-- Automatic scheduled daily scan
-- Telegram or SMTP email notifications
-- Lightyear-only tradable universe filter via whitelist CSV
-- Simple lead-lag bonus signal between securities
-
-Install
--------
-pip install streamlit pandas numpy yfinance apscheduler pytz
-
-Run dashboard
--------------
-streamlit run portfolio_signal_dashboard_lightyear.py
-
-Run daily job once
-------------------
-python portfolio_signal_dashboard_lightyear.py --run-job
-
-Run scheduler in background/terminal
-------------------------------------
-python portfolio_signal_dashboard_lightyear.py --scheduler --hour 18 --minute 10 --timezone Europe/Tallinn
-
-Lightyear universe file
------------------------
-Create portfolio_state/lightyear_universe.csv with a column named symbol:
-
-symbol
-AAPL
-MSFT
-NVDA
-VWCE
-EUNL
-CNDX
-...
-
-The app will only propose symbols present in that file when strict Lightyear filtering is enabled.
-
-Notes
------
-- This is a model portfolio, not broker execution.
-- yfinance is suitable for prototyping and research, not institutional production.
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
 import math
 import smtplib
-from dataclasses import dataclass
 from datetime import date, datetime
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -92,43 +39,50 @@ DEFAULT_MAX_NEW_POSITIONS_PER_DAY = 3
 DEFAULT_MIN_CASH_BUFFER_PCT = 0.05
 
 DEFAULT_LIGHTYEAR_SAFE_UNIVERSE = [
-    "SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU",
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "AVGO", "NFLX",
-    "JPM", "BAC", "GS", "XOM", "CVX", "LLY", "UNH", "COST", "CRM", "ORCL", "ADBE",
+    "SPY", "QQQ", "IWM", "DIA",
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU",
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
+    "AMD", "AVGO", "NFLX", "JPM", "BAC", "GS", "XOM", "CVX",
+    "LLY", "UNH", "COST", "CRM", "ORCL", "ADBE",
     "VWCE", "VUSA", "CSPX", "EUNL", "SXR8", "VUAA", "CNDX", "IUIT",
 ]
 
 
-@dataclass
 class StrategyConfig:
-    benchmark: str = DEFAULT_BENCHMARK
-    min_history_rows: int = 120
-    atr_stop_multiple: float = 2.5
+    def __init__(
+        self,
+        benchmark: str = DEFAULT_BENCHMARK,
+        leadlag_enabled: bool = True,
+    ) -> None:
+        self.benchmark = benchmark
 
-    regime_fast_ma: int = 50
-    regime_slow_ma: int = 200
+        self.min_history_rows = 120
+        self.atr_stop_multiple = 2.5
 
-    sma_fast: int = 20
-    sma_mid: int = 50
-    sma_slow: int = 200
-    breakout_lookback: int = 20
-    momentum_lookback: int = 63
-    volume_lookback: int = 20
-    atr_lookback: int = 14
-    rs_lookback: int = 63
+        self.regime_fast_ma = 50
+        self.regime_slow_ma = 200
 
-    min_price: float = 5.0
-    min_avg_dollar_volume: float = 10_000_000.0
-    min_score_buy: float = 4.0
-    max_score_sell: float = -3.0
+        self.sma_fast = 20
+        self.sma_mid = 50
+        self.sma_slow = 200
+        self.breakout_lookback = 20
+        self.momentum_lookback = 63
+        self.volume_lookback = 20
+        self.atr_lookback = 14
+        self.rs_lookback = 63
 
-    leadlag_enabled: bool = True
-    leadlag_train_window: int = 252
-    leadlag_max_lag: int = 3
-    leadlag_min_abs_corr: float = 0.25
-    leadlag_min_obs: int = 80
-    leadlag_min_t_stat: float = 2.0
-    leadlag_bonus_scale: float = 1.25
+        self.min_price = 5.0
+        self.min_avg_dollar_volume = 10_000_000.0
+        self.min_score_buy = 4.0
+        self.max_score_sell = -3.0
+
+        self.leadlag_enabled = leadlag_enabled
+        self.leadlag_train_window = 252
+        self.leadlag_max_lag = 3
+        self.leadlag_min_abs_corr = 0.25
+        self.leadlag_min_obs = 80
+        self.leadlag_min_t_stat = 2.0
+        self.leadlag_bonus_scale = 1.25
 
 
 def default_settings() -> Dict:
@@ -141,7 +95,7 @@ def default_settings() -> Dict:
         "min_cash_buffer_pct": DEFAULT_MIN_CASH_BUFFER_PCT,
         "last_scan_date": None,
         "auto_scan_enabled": True,
-        "scheduled_hour": 18,
+        "scheduled_hour": 23,
         "scheduled_minute": 10,
         "scheduled_timezone": DEFAULT_TIMEZONE,
         "notifications_enabled": False,
@@ -206,8 +160,11 @@ def save_portfolio(portfolio: Dict) -> None:
 def append_csv_row(path: Path, row: Dict) -> None:
     df_new = pd.DataFrame([row])
     if path.exists():
-        df_old = pd.read_csv(path)
-        df = pd.concat([df_old, df_new], ignore_index=True)
+        try:
+            df_old = pd.read_csv(path)
+            df = pd.concat([df_old, df_new], ignore_index=True)
+        except Exception:
+            df = df_new
     else:
         df = df_new
     df.to_csv(path, index=False)
@@ -234,13 +191,10 @@ def effective_scan_universe(settings: Dict) -> Tuple[List[str], List[str]]:
     lightyear_set = set(lightyear)
     strict = bool(settings.get("strict_lightyear_only", True))
 
-    if strict:
-        filtered = [x for x in requested if x in lightyear_set]
-    else:
-        filtered = requested
-
+    filtered = [x for x in requested if x in lightyear_set] if strict else requested
     if not filtered:
         filtered = lightyear.copy()
+
     return filtered, lightyear
 
 
@@ -278,11 +232,14 @@ def download_universe_data(symbols: List[str], period: str = DEFAULT_PERIOD, int
 
 def compute_atr(df: pd.DataFrame, lookback: int) -> pd.Series:
     prev_close = df["Close"].shift(1)
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - prev_close).abs(),
-        (df["Low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
+    tr = pd.concat(
+        [
+            df["High"] - df["Low"],
+            (df["High"] - prev_close).abs(),
+            (df["Low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
     return tr.rolling(window=lookback, min_periods=lookback).mean()
 
 
@@ -315,13 +272,22 @@ def compute_market_regime(benchmark_df: pd.DataFrame, cfg: StrategyConfig) -> st
     return "NEUTRAL"
 
 
-def relative_strength_score(symbol_df: pd.DataFrame, benchmark_df: pd.DataFrame, lookback: int) -> float:
-    joined = pd.concat([
-        symbol_df[["Close"]].rename(columns={"Close": "sym_close"}),
-        benchmark_df[["Close"]].rename(columns={"Close": "bench_close"}),
-    ], axis=1, join="inner").dropna()
+def relative_strength_score(symbol_df: pd.DataFrame, benchmark_df: Optional[pd.DataFrame], lookback: int) -> float:
+    if benchmark_df is None or benchmark_df.empty or "Close" not in benchmark_df.columns:
+        return np.nan
+
+    joined = pd.concat(
+        [
+            symbol_df[["Close"]].rename(columns={"Close": "sym_close"}),
+            benchmark_df[["Close"]].rename(columns={"Close": "bench_close"}),
+        ],
+        axis=1,
+        join="inner",
+    ).dropna()
+
     if len(joined) < lookback + 5:
         return np.nan
+
     rs = joined["sym_close"] / joined["bench_close"]
     return float(rs.iloc[-1] / rs.iloc[-lookback] - 1.0)
 
@@ -352,10 +318,14 @@ def discover_lead_lag_relationships(returns_panel: pd.DataFrame, symbols: List[s
                 continue
             leader_series = panel[leader]
             for lag in range(1, cfg.leadlag_max_lag + 1):
-                joined = pd.concat([
-                    leader_series.shift(lag).rename("leader"),
-                    follower_series.rename("follower"),
-                ], axis=1).dropna()
+                joined = pd.concat(
+                    [
+                        leader_series.shift(lag).rename("leader"),
+                        follower_series.rename("follower"),
+                    ],
+                    axis=1,
+                ).dropna()
+
                 n = len(joined)
                 if n < cfg.leadlag_min_obs:
                     continue
@@ -378,6 +348,7 @@ def discover_lead_lag_relationships(returns_panel: pd.DataFrame, symbols: List[s
                 corr_second = second["leader"].corr(second["follower"])
                 if pd.isna(corr_first) or pd.isna(corr_second):
                     continue
+
                 sign_consistency = int(np.sign(corr_first) == np.sign(corr_second) == np.sign(corr))
                 if not sign_consistency:
                     continue
@@ -393,6 +364,7 @@ def discover_lead_lag_relationships(returns_panel: pd.DataFrame, symbols: List[s
                 }
                 if best is None or abs(candidate["corr"]) > abs(best["corr"]):
                     best = candidate
+
         if best is not None:
             relationships.append(best)
 
@@ -402,16 +374,19 @@ def discover_lead_lag_relationships(returns_panel: pd.DataFrame, symbols: List[s
 def compute_leadlag_signal(symbol: str, relationships: pd.DataFrame, returns_panel: pd.DataFrame, cfg: StrategyConfig) -> Tuple[float, str]:
     if relationships.empty or returns_panel.empty:
         return 0.0, ""
+
     rows = relationships[relationships["follower"] == symbol]
     if rows.empty:
         return 0.0, ""
 
     best_bonus = 0.0
     best_reason = ""
+
     for _, rel in rows.iterrows():
         leader = str(rel["leader"])
         lag = int(rel["lag"])
         corr = float(rel["corr"])
+
         if leader not in returns_panel.columns:
             continue
 
@@ -431,6 +406,7 @@ def compute_leadlag_signal(symbol: str, relationships: pd.DataFrame, returns_pan
 
         raw_bonus = np.sign(leader_ret) * np.sign(corr) * min(abs(corr), 0.4) * cfg.leadlag_bonus_scale
         bonus = float(np.sign(raw_bonus) * min(abs(raw_bonus), 0.5))
+
         if abs(bonus) > abs(best_bonus):
             best_bonus = bonus
             arrow = "↑" if leader_ret > 0 else "↓"
@@ -440,8 +416,15 @@ def compute_leadlag_signal(symbol: str, relationships: pd.DataFrame, returns_pan
     return round(best_bonus, 3), best_reason
 
 
-def score_symbol(symbol: str, df: pd.DataFrame, benchmark_df: pd.DataFrame, regime: str, cfg: StrategyConfig,
-                 leadlag_bonus: float = 0.0, leadlag_reason: str = "") -> Dict:
+def score_symbol(
+    symbol: str,
+    df: pd.DataFrame,
+    benchmark_df: Optional[pd.DataFrame],
+    regime: str,
+    cfg: StrategyConfig,
+    leadlag_bonus: float = 0.0,
+    leadlag_reason: str = "",
+) -> Dict:
     x = add_indicators(df, cfg)
     if len(x) < cfg.min_history_rows:
         return {"symbol": symbol, "action": "SKIP", "score": np.nan, "reason": "not enough history"}
@@ -558,7 +541,7 @@ def score_symbol(symbol: str, df: pd.DataFrame, benchmark_df: pd.DataFrame, regi
     if pd.notna(atr):
         stop_ref = price - cfg.atr_stop_multiple * atr if action == "BUY" else price + cfg.atr_stop_multiple * atr
 
-        aligned = 0
+    aligned = 0
     if action == "BUY" and leadlag_bonus > 0:
         aligned = 1
     elif action == "SELL" and leadlag_bonus < 0:
@@ -574,8 +557,6 @@ def score_symbol(symbol: str, df: pd.DataFrame, benchmark_df: pd.DataFrame, regi
         conviction = "High conviction"
     elif abs_score >= 5.0:
         confidence = "Medium"
-    else:
-        confidence = "Low"
 
     return {
         "symbol": symbol,
@@ -595,15 +576,23 @@ def score_symbol(symbol: str, df: pd.DataFrame, benchmark_df: pd.DataFrame, regi
     }
 
 
-def run_daily_scan(universe: List[str], benchmark: str, leadlag_enabled: bool = True) -> Tuple[str, pd.DataFrame, Dict[str, pd.DataFrame], pd.DataFrame]:
+def run_daily_scan(
+    universe: List[str],
+    benchmark: str,
+    leadlag_enabled: bool = True,
+) -> Tuple[str, pd.DataFrame, Dict[str, pd.DataFrame], pd.DataFrame]:
     cfg = StrategyConfig(benchmark=benchmark, leadlag_enabled=leadlag_enabled)
+
     symbols = sorted(set(universe + [benchmark]))
     data = download_universe_data(symbols)
-    if benchmark not in data:
-        raise RuntimeError(f"Benchmark data missing for {benchmark}")
 
-    benchmark_df = data[benchmark]
-    regime = compute_market_regime(benchmark_df, cfg)
+    benchmark_df = data.get(benchmark)
+    if benchmark_df is None or benchmark_df.empty:
+        regime = "NEUTRAL"
+        benchmark_df = None
+    else:
+        regime = compute_market_regime(benchmark_df, cfg)
+
     returns_panel = build_returns_panel(data)
     relationships = discover_lead_lag_relationships(returns_panel, universe, cfg) if leadlag_enabled else pd.DataFrame()
 
@@ -613,11 +602,26 @@ def run_daily_scan(universe: List[str], benchmark: str, leadlag_enabled: bool = 
         if df is None or df.empty:
             rows.append({"symbol": symbol, "action": "SKIP", "score": np.nan, "reason": "missing data"})
             continue
+
         leadlag_bonus, leadlag_reason = (0.0, "")
         if leadlag_enabled:
             leadlag_bonus, leadlag_reason = compute_leadlag_signal(symbol, relationships, returns_panel, cfg)
+
         try:
-            rows.append(score_symbol(symbol, df, benchmark_df, regime, cfg, leadlag_bonus, leadlag_reason))
+            result = score_symbol(
+                symbol=symbol,
+                df=df,
+                benchmark_df=benchmark_df,
+                regime=regime,
+                cfg=cfg,
+                leadlag_bonus=leadlag_bonus,
+                leadlag_reason=leadlag_reason,
+            )
+            if benchmark_df is None:
+                extra = f"benchmark unavailable: {benchmark}"
+                existing_reason = str(result.get("reason", ""))
+                result["reason"] = f"{existing_reason}; {extra}" if existing_reason else extra
+            rows.append(result)
         except Exception as exc:
             rows.append({"symbol": symbol, "action": "SKIP", "score": np.nan, "reason": f"error: {exc}"})
 
@@ -625,6 +629,7 @@ def run_daily_scan(universe: List[str], benchmark: str, leadlag_enabled: bool = 
     if not signals.empty:
         signals["scan_date"] = pd.Timestamp(date.today())
         signals = signals.sort_values(["action", "score"], ascending=[True, False])
+
     return regime, signals, data, relationships
 
 
@@ -810,8 +815,8 @@ def build_notification_message(regime: str, proposals: pd.DataFrame, settings: D
                 ll = row.get("leadlag_bonus")
                 ll_text = f" | lead-lag {float(ll):+.2f}" if pd.notna(ll) else ""
                 conf_text = f" | {row.get('confidence', 'NA')}"
-                conv = row.get('conviction', 'Normal')
-                conv_text = f" | {conv}" if conv and conv != 'Normal' else ""
+                conv = row.get("conviction", "Normal")
+                conv_text = f" | {conv}" if conv and conv != "Normal" else ""
                 lines.append(f"- {row['symbol']} @ {float(row['close']):.2f} | score {float(row['score']):+.2f}{conf_text}{conv_text}{qty_text}{ll_text}")
         lines.append("")
     return "\n".join(lines).strip()
@@ -854,7 +859,14 @@ def send_notifications(settings: Dict, regime: str, proposals: pd.DataFrame) -> 
     channel = settings.get("notification_channel", "Telegram")
     if channel == "Telegram":
         return send_telegram_message(settings.get("telegram_bot_token", ""), settings.get("telegram_chat_id", ""), text)
-    return send_email_message(settings.get("smtp_host", "smtp.gmail.com"), int(settings.get("smtp_port", 587)), settings.get("smtp_username", ""), settings.get("smtp_password", ""), settings.get("smtp_to", ""), text)
+    return send_email_message(
+        settings.get("smtp_host", "smtp.gmail.com"),
+        int(settings.get("smtp_port", 587)),
+        settings.get("smtp_username", ""),
+        settings.get("smtp_password", ""),
+        settings.get("smtp_to", ""),
+        text,
+    )
 
 
 def execute_daily_job() -> Dict:
@@ -866,11 +878,9 @@ def execute_daily_job() -> Dict:
     universe, lightyear_universe = effective_scan_universe(settings)
     benchmark = str(settings.get("benchmark", DEFAULT_BENCHMARK)).upper().strip()
 
-    # Always include benchmark in the downloaded universe.
     if benchmark not in universe:
         universe.append(benchmark)
 
-    # Keep benchmark visible in the Lightyear list metadata if strict filtering is enabled.
     if settings.get("strict_lightyear_only", True) and benchmark not in lightyear_universe:
         lightyear_universe.append(benchmark)
 
@@ -879,11 +889,13 @@ def execute_daily_job() -> Dict:
         benchmark=benchmark,
         leadlag_enabled=bool(settings.get("leadlag_enabled", True)),
     )
+
     settings["last_scan_date"] = str(date.today())
     save_settings(settings)
 
     update_position_marks(portfolio, signals)
     save_portfolio(portfolio)
+
     proposals = build_actionable_proposals(portfolio, settings, signals)
 
     if not signals.empty:
@@ -891,11 +903,21 @@ def execute_daily_job() -> Dict:
         export["benchmark"] = benchmark
         export["regime"] = regime
         export.to_csv(HISTORY_FILE, index=False)
+
     if not relationships.empty:
         relationships.to_csv(LEADLAG_FILE, index=False)
 
     notif_ok, notif_msg = send_notifications(settings, regime, proposals)
-    return {"regime": regime, "signals": signals, "proposals": proposals, "relationships": relationships, "notification_ok": notif_ok, "notification_message": notif_msg, "scan_universe": universe}
+
+    return {
+        "regime": regime,
+        "signals": signals,
+        "proposals": proposals,
+        "relationships": relationships,
+        "notification_ok": notif_ok,
+        "notification_message": notif_msg,
+        "scan_universe": universe,
+    }
 
 
 def fmt_money(x: float) -> str:
@@ -946,6 +968,7 @@ def run_streamlit_app() -> None:
 
     with st.sidebar:
         st.header("Seaded")
+
         investable_amount = st.number_input("Investeeritav summa", min_value=0.0, value=float(settings.get("investable_amount", 10000.0)), step=100.0)
         benchmark = st.text_input("Benchmark", value=str(settings.get("benchmark", DEFAULT_BENCHMARK))).upper().strip()
         universe_text = st.text_area("Jälgitavad tickerid (komaga eraldatud)", value=", ".join(settings.get("user_universe", DEFAULT_LIGHTYEAR_SAFE_UNIVERSE)), height=130)
@@ -957,7 +980,7 @@ def run_streamlit_app() -> None:
 
         st.subheader("Automaatkäivitus")
         auto_scan_enabled = st.checkbox("Automaatne päevaskänn lubatud", value=bool(settings.get("auto_scan_enabled", True)))
-        scheduled_hour = st.number_input("Tund", min_value=0, max_value=23, value=int(settings.get("scheduled_hour", 18)), step=1)
+        scheduled_hour = st.number_input("Tund", min_value=0, max_value=23, value=int(settings.get("scheduled_hour", 23)), step=1)
         scheduled_minute = st.number_input("Minut", min_value=0, max_value=59, value=int(settings.get("scheduled_minute", 10)), step=1)
         scheduled_timezone = st.text_input("Timezone", value=str(settings.get("scheduled_timezone", DEFAULT_TIMEZONE)))
 
@@ -1035,8 +1058,6 @@ def run_streamlit_app() -> None:
 
     if run_scan_now:
         try:
-            # Persist the currently visible sidebar values before running,
-            # so the scan uses exactly what the user sees in the UI.
             parsed_universe = [x.strip().upper() for x in universe_text.split(",") if x.strip()]
             settings.update({
                 "investable_amount": float(investable_amount),
@@ -1068,7 +1089,13 @@ def run_streamlit_app() -> None:
             signals = result["signals"]
             proposals = result["proposals"]
             relationships = result["relationships"]
-            st.success(f"Skänn tehtud. Turu režiim: {regime}. Teavitused: {result['notification_message']}")
+
+            benchmark_available = bool(result["scan_universe"]) and str(settings.get("benchmark", "")).upper().strip() in set(result["scan_universe"])
+            msg = f"Skänn tehtud. Turu režiim: {regime}. Teavitused: {result['notification_message']}"
+            if not signals.empty and signals["reason"].astype(str).str.contains("benchmark unavailable", case=False, na=False).any():
+                st.warning("Benchmark ei laadinud ära. Scan jooksis edasi NEUTRAL režiimis.")
+            st.success(msg)
+
         except Exception as exc:
             st.error(f"Skänn ebaõnnestus: {exc}")
 
@@ -1082,6 +1109,7 @@ def run_streamlit_app() -> None:
             proposals = build_actionable_proposals(portfolio, settings, signals)
         except Exception:
             pass
+
     if LEADLAG_FILE.exists() and relationships.empty:
         try:
             relationships = pd.read_csv(LEADLAG_FILE)
@@ -1112,7 +1140,15 @@ def run_streamlit_app() -> None:
                     b.write(f"Eeldatav kulu: {fmt_money(abs(float(row['estimated_cash_impact'])))}")
                     b.write(f"Põhjus: {row['reason']}")
                     if c.button(f"Aksepteeri BUY {sym}", key=f"buy_{sym}", use_container_width=True):
-                        st.success(accept_buy(portfolio, sym, int(row['quantity']), float(row['close']), str(row.get('reason', '')), None if pd.isna(row.get('score')) else float(row.get('score')), None if pd.isna(row.get('stop_reference')) else float(row.get('stop_reference'))))
+                        st.success(accept_buy(
+                            portfolio,
+                            sym,
+                            int(row["quantity"]),
+                            float(row["close"]),
+                            str(row.get("reason", "")),
+                            None if pd.isna(row.get("score")) else float(row.get("score")),
+                            None if pd.isna(row.get("stop_reference")) else float(row.get("stop_reference")),
+                        ))
                         st.rerun()
 
         with sell_tab:
@@ -1132,7 +1168,13 @@ def run_streamlit_app() -> None:
                     b.write(f"Eeldatav laekumine: {fmt_money(float(row['estimated_cash_impact']))}")
                     b.write(f"Põhjus: {row['reason']}")
                     if c.button(f"Aksepteeri SELL {sym}", key=f"sell_{sym}", use_container_width=True):
-                        st.success(accept_sell(portfolio, sym, float(row['close']), str(row.get('reason', '')), None if pd.isna(row.get('score')) else float(row.get('score'))))
+                        st.success(accept_sell(
+                            portfolio,
+                            sym,
+                            float(row["close"]),
+                            str(row.get("reason", "")),
+                            None if pd.isna(row.get("score")) else float(row.get("score")),
+                        ))
                         st.rerun()
 
         with hold_tab:
@@ -1152,8 +1194,9 @@ def run_streamlit_app() -> None:
                     b.write(f"Stop viide: {row.get('stop_reference')}")
                     b.write(f"Põhjus: {row['reason']}")
                     if c.button(f"Märgi HOLD {sym}", key=f"hold_{sym}", use_container_width=True):
-                        record_hold_review(sym, str(row.get('reason', '')), None if pd.isna(row.get('score')) else float(row.get('score')))
+                        record_hold_review(sym, str(row.get("reason", "")), None if pd.isna(row.get("score")) else float(row.get("score")))
                         st.success(f"HOLD ülevaatus salvestatud: {sym}.")
+                        st.rerun()
 
     st.subheader("Portfelli seis")
     portfolio_df = portfolio_snapshot_df(portfolio)
@@ -1187,25 +1230,23 @@ def run_scheduler(hour: int, minute: int, timezone: str) -> None:
     tz = pytz.timezone(timezone)
     scheduler = BlockingScheduler(timezone=tz)
 
-    # Final daily run (global close)
-    scheduler.add_job(
-        execute_daily_job,
-        "cron",
-        hour=hour,
-        minute=minute,
-        id="portfolio_daily_final",
-        replace_existing=True,
-        coalesce=True,
-        max_instances=1,
-    )
-
-    # Europe preview run (fixed 18:40 local time)
     scheduler.add_job(
         execute_daily_job,
         "cron",
         hour=18,
         minute=40,
         id="portfolio_daily_europe_preview",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    scheduler.add_job(
+        execute_daily_job,
+        "cron",
+        hour=hour,
+        minute=minute,
+        id="portfolio_daily_final",
         replace_existing=True,
         coalesce=True,
         max_instances=1,
@@ -1219,7 +1260,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Portfolio Signal Dashboard Lightyear")
     parser.add_argument("--run-job", action="store_true", help="Run the daily scan job once")
     parser.add_argument("--scheduler", action="store_true", help="Run daily scheduler")
-    parser.add_argument("--hour", type=int, default=18)
+    parser.add_argument("--hour", type=int, default=23)
     parser.add_argument("--minute", type=int, default=10)
     parser.add_argument("--timezone", type=str, default=DEFAULT_TIMEZONE)
     return parser.parse_args()
