@@ -600,11 +600,7 @@ def run_daily_scan(universe: List[str], benchmark: str, leadlag_enabled: bool = 
     symbols = sorted(set(universe + [benchmark]))
     data = download_universe_data(symbols)
     if benchmark not in data:
-    rows = [{"symbol": s, "action": "SKIP", "score": np.nan, "reason": f"benchmark missing: {benchmark}"} for s in universe]
-    signals = pd.DataFrame(rows)
-    if not signals.empty:
-        signals["scan_date"] = pd.Timestamp(date.today())
-    return "NEUTRAL", signals, data, pd.DataFrame()
+        raise RuntimeError(f"Benchmark data missing for {benchmark}")
 
     benchmark_df = data[benchmark]
     regime = compute_market_regime(benchmark_df, cfg)
@@ -869,12 +865,20 @@ def execute_daily_job() -> Dict:
 
     universe, lightyear_universe = effective_scan_universe(settings)
     benchmark = str(settings.get("benchmark", DEFAULT_BENCHMARK)).upper().strip()
+
+    # Always include benchmark in the downloaded universe.
     if benchmark not in universe:
-        universe = universe + [benchmark]
+        universe.append(benchmark)
+
+    # Keep benchmark visible in the Lightyear list metadata if strict filtering is enabled.
     if settings.get("strict_lightyear_only", True) and benchmark not in lightyear_universe:
         lightyear_universe.append(benchmark)
 
-    regime, signals, _, relationships = run_daily_scan(universe=universe, benchmark=benchmark, leadlag_enabled=bool(settings.get("leadlag_enabled", True)))
+    regime, signals, _, relationships = run_daily_scan(
+        universe=universe,
+        benchmark=benchmark,
+        leadlag_enabled=bool(settings.get("leadlag_enabled", True)),
+    )
     settings["last_scan_date"] = str(date.today())
     save_settings(settings)
 
