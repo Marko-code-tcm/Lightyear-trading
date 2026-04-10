@@ -600,7 +600,11 @@ def run_daily_scan(universe: List[str], benchmark: str, leadlag_enabled: bool = 
     symbols = sorted(set(universe + [benchmark]))
     data = download_universe_data(symbols)
     if benchmark not in data:
-        raise RuntimeError(f"Benchmark data missing for {benchmark}")
+    rows = [{"symbol": s, "action": "SKIP", "score": np.nan, "reason": f"benchmark missing: {benchmark}"} for s in universe]
+    signals = pd.DataFrame(rows)
+    if not signals.empty:
+        signals["scan_date"] = pd.Timestamp(date.today())
+    return "NEUTRAL", signals, data, pd.DataFrame()
 
     benchmark_df = data[benchmark]
     regime = compute_market_regime(benchmark_df, cfg)
