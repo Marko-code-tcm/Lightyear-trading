@@ -15,7 +15,7 @@ import streamlit as st
 import yfinance as yf
 
 
-# VERSION 2026-04-12-STRICTNESS
+# VERSION 2026-04-12-TOP10
 
 APP_DIR = Path(".")
 STATE_DIR = APP_DIR / "portfolio_state"
@@ -402,6 +402,30 @@ def run_daily_scan(universe: List[str], benchmark: str, strictness: int) -> Tupl
         signals = signals.sort_values(["action", "score"], ascending=[True, False])
 
     return regime, signals, data
+
+
+def summarize_signals(signals: pd.DataFrame) -> Dict[str, int]:
+    if signals.empty or "action" not in signals.columns:
+        return {"BUY": 0, "HOLD": 0, "SELL": 0, "SKIP": 0}
+    counts = signals["action"].value_counts().to_dict()
+    return {
+        "BUY": int(counts.get("BUY", 0)),
+        "HOLD": int(counts.get("HOLD", 0)),
+        "SELL": int(counts.get("SELL", 0)),
+        "SKIP": int(counts.get("SKIP", 0)),
+    }
+
+
+def top_signals_df(signals: pd.DataFrame, n: int = 10) -> pd.DataFrame:
+    if signals.empty:
+        return pd.DataFrame()
+    df = signals.copy()
+    df = df[df["action"] != "SKIP"].copy() if "action" in df.columns else df
+    if df.empty:
+        return pd.DataFrame()
+    df = df.sort_values("score", ascending=False).head(n)
+    cols = ["symbol", "action", "score", "confidence", "conviction", "signal_price", "close", "reason"]
+    return df[[c for c in cols if c in df.columns]].copy()
 
 
 def normalize_positions(portfolio: Dict) -> None:
@@ -801,7 +825,7 @@ def render_mobile_header(settings: Dict) -> Tuple[float, str, str, str, int, flo
     smtp_password = str(settings.get("smtp_password", ""))
     signal_strictness = int(settings.get("signal_strictness", 3))
 
-    st.caption("Mobiilivaade: ainult scan nupp, portfelli seis ja scan'i järel soovitused.")
+    st.caption("Mobiilivaade: ainult scan nupp, portfelli seis, top signaalid ja scan'i järel soovitused.")
     st.caption(f"Analüüsi rangus: {get_strictness_label(signal_strictness)}")
     return (
         investable_amount,
@@ -861,6 +885,25 @@ def render_portfolio_overview(portfolio: Dict) -> None:
     c2.metric("Vaba raha", fmt_money(cash))
     c3.metric("Investeeritud", fmt_money(pv - cash))
     c4.metric("Avatud positsioone", str(len(portfolio.get("positions", {}))))
+
+
+def render_signal_summary(signals: pd.DataFrame) -> None:
+    st.subheader("Signaalide kokkuvõte")
+    counts = summarize_signals(signals)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("BUY", counts["BUY"])
+    c2.metric("HOLD", counts["HOLD"])
+    c3.metric("SELL", counts["SELL"])
+    c4.metric("SKIP", counts["SKIP"])
+
+
+def render_top_signals(signals: pd.DataFrame) -> None:
+    st.subheader("Top 10 signaalid täna")
+    top_df = top_signals_df(signals, 10)
+    if top_df.empty:
+        st.write("Täna top signaale ei ole.")
+        return
+    st.dataframe(top_df, use_container_width=True, hide_index=True)
 
 
 def render_proposals(proposals: pd.DataFrame, portfolio: Dict) -> None:
@@ -1035,6 +1078,17 @@ def run_streamlit_app() -> None:
 
     st.subheader("Portfelli seis")
     st.dataframe(portfolio_snapshot_df(portfolio), use_container_width=True, hide_index=True)
+
+    if not signals.empty:
+        render_signal_summary(signals)
+        render_top_signals(signals)
+    elif HISTORY_FILE.exists():
+        try:
+            hist = pd.read_csv(HISTORY_FILE)
+            render_signal_summary(hist)
+            render_top_signals(hist)
+        except Exception:
+            pass
 
     if run_scan_now or not proposals.empty:
         render_proposals(proposals, portfolio)
