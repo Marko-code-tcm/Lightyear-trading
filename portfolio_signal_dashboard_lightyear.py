@@ -15,7 +15,7 @@ import streamlit as st
 import yfinance as yf
 
 
-# VERSION 2026-04-12-MOBILE-TOGGLE
+# VERSION 2026-04-12-STRICTNESS
 
 APP_DIR = Path(".")
 STATE_DIR = APP_DIR / "portfolio_state"
@@ -53,6 +53,7 @@ def default_settings() -> Dict:
         "smtp_port": 587,
         "smtp_username": "",
         "smtp_password": "",
+        "signal_strictness": 3,
     }
 
 
@@ -110,6 +111,26 @@ def append_csv_row(path: Path, row: Dict) -> None:
     else:
         df = df_new
     df.to_csv(path, index=False)
+
+
+def get_thresholds(strictness: int) -> Tuple[float, float]:
+    mapping = {
+        1: (3.0, -2.0),
+        2: (4.0, -3.0),
+        3: (5.0, -4.0),
+        4: (6.0, -5.0),
+    }
+    return mapping.get(strictness, (5.0, -4.0))
+
+
+def get_strictness_label(strictness: int) -> str:
+    labels = {
+        1: "Leebe",
+        2: "Tavaline",
+        3: "Range",
+        4: "Väga range",
+    }
+    return labels.get(strictness, "Range")
 
 
 def download_symbol_history(symbol: str, period: str = "18mo", interval: str = "1d") -> pd.DataFrame:
@@ -209,7 +230,13 @@ def relative_strength_score(symbol_df: pd.DataFrame, benchmark_df: Optional[pd.D
     return float(rs.iloc[-1] / rs.iloc[-lookback] - 1.0)
 
 
-def score_symbol(symbol: str, df: pd.DataFrame, benchmark_df: Optional[pd.DataFrame], regime: str) -> Dict:
+def score_symbol(
+    symbol: str,
+    df: pd.DataFrame,
+    benchmark_df: Optional[pd.DataFrame],
+    regime: str,
+    strictness: int,
+) -> Dict:
     x = add_indicators(df)
     if len(x) < 120:
         return {"symbol": symbol, "action": "SKIP", "score": np.nan, "reason": "not enough history"}
@@ -294,17 +321,35 @@ def score_symbol(symbol: str, df: pd.DataFrame, benchmark_df: Optional[pd.DataFr
     elif regime == "BEAR":
         score -= 1.5
 
+    buy_threshold, sell_threshold = get_thresholds(strictness)
+
     action = "HOLD"
-    if score >= 4.0 and regime != "BEAR":
+    if score >= buy_threshold and regime != "BEAR":
         action = "BUY"
-    elif score <= -3.0:
+    elif score <= sell_threshold:
         action = "SELL"
 
     confidence = "Low"
-    if abs(score) >= 6.5:
-        confidence = "High"
-    elif abs(score) >= 5.0:
-        confidence = "Medium"
+    if strictness == 1:
+        if abs(score) >= 5.5:
+            confidence = "High"
+        elif abs(score) >= 4.0:
+            confidence = "Medium"
+    elif strictness == 2:
+        if abs(score) >= 6.0:
+            confidence = "High"
+        elif abs(score) >= 4.5:
+            confidence = "Medium"
+    elif strictness == 3:
+        if abs(score) >= 6.5:
+            confidence = "High"
+        elif abs(score) >= 5.0:
+            confidence = "Medium"
+    else:
+        if abs(score) >= 7.0:
+            confidence = "High"
+        elif abs(score) >= 5.5:
+            confidence = "Medium"
 
     stop_ref = np.nan
     if pd.notna(atr):
@@ -323,12 +368,12 @@ def score_symbol(symbol: str, df: pd.DataFrame, benchmark_df: Optional[pd.DataFr
         "avg_dollar_vol_20": round(avg_dollar_vol, 2),
         "stop_reference": round(float(stop_ref), 4) if pd.notna(stop_ref) else np.nan,
         "confidence": confidence,
-        "conviction": "Normal",
+        "conviction": get_strictness_label(strictness),
         "reason": "; ".join(reasons[:8]),
     }
 
 
-def run_daily_scan(universe: List[str], benchmark: str) -> Tuple[str, pd.DataFrame, Dict[str, pd.DataFrame]]:
+def run_daily_scan(universe: List[str], benchmark: str, strictness: int) -> Tuple[str, pd.DataFrame, Dict[str, pd.DataFrame]]:
     symbols = sorted(set(universe + [benchmark]))
     data = download_universe_data(symbols)
 
@@ -343,7 +388,7 @@ def run_daily_scan(universe: List[str], benchmark: str) -> Tuple[str, pd.DataFra
             continue
 
         try:
-            result = score_symbol(symbol, df, benchmark_df, regime)
+            result = score_symbol(symbol, df, benchmark_df, regime, strictness)
             if benchmark_df is None:
                 extra = f"benchmark unavailable: {benchmark}"
                 result["reason"] = f"{result.get('reason', '')}; {extra}".strip("; ")
@@ -575,6 +620,7 @@ def build_notification_message(regime: str, proposals: pd.DataFrame, settings: D
     lines = [
         f"Daily portfolio scan — {date.today().isoformat()}",
         f"Benchmark: {settings.get('benchmark')} | Regime: {regime}",
+        f"Strictness: {get_strictness_label(int(settings.get('signal_strictness', 3)))}",
         "",
     ]
     for label in ["BUY", "SELL", "HOLD"]:
@@ -607,11 +653,12 @@ def send_notifications(settings: Dict, regime: str, proposals: pd.DataFrame) -> 
 def execute_daily_job(settings: Dict, portfolio: Dict) -> Dict:
     universe = [str(x).strip().upper() for x in settings.get("user_universe", []) if str(x).strip()]
     benchmark = str(settings.get("benchmark", DEFAULT_BENCHMARK)).upper().strip()
+    strictness = int(settings.get("signal_strictness", 3))
 
     if benchmark not in universe:
         universe.append(benchmark)
 
-    regime, signals, data = run_daily_scan(universe, benchmark)
+    regime, signals, data = run_daily_scan(universe, benchmark, strictness)
 
     settings["last_scan_date"] = str(date.today())
     save_settings(settings)
@@ -625,6 +672,7 @@ def execute_daily_job(settings: Dict, portfolio: Dict) -> Dict:
         export = signals.copy()
         export["benchmark"] = benchmark
         export["regime"] = regime
+        export["strictness"] = strictness
         export.to_csv(HISTORY_FILE, index=False)
 
     notif_ok, notif_msg = send_notifications(settings, regime, proposals)
@@ -669,7 +717,7 @@ def portfolio_snapshot_df(portfolio: Dict) -> pd.DataFrame:
 def proposal_table_df(proposals: pd.DataFrame) -> pd.DataFrame:
     if proposals.empty:
         return proposals
-    cols = ["symbol", "proposal_type", "score", "confidence", "signal_price", "close", "quantity", "estimated_cash_impact", "stop_reference", "reason"]
+    cols = ["symbol", "proposal_type", "score", "confidence", "conviction", "signal_price", "close", "quantity", "estimated_cash_impact", "stop_reference", "reason"]
     return proposals[[c for c in cols if c in proposals.columns]].copy()
 
 
@@ -678,8 +726,7 @@ def is_probably_mobile() -> bool:
     if isinstance(ua, list):
         ua = " ".join(ua)
     ua = str(ua).lower()
-    mobile_markers = ["iphone", "android", "mobile"]
-    return any(marker in ua for marker in mobile_markers)
+    return any(marker in ua for marker in ["iphone", "android", "mobile"])
 
 
 def init_view_mode() -> None:
@@ -702,7 +749,7 @@ def render_top_bar() -> None:
             st.rerun()
 
 
-def render_desktop_sidebar(settings: Dict) -> Tuple[float, str, str, str, int, float, bool, str, int, str, str]:
+def render_desktop_sidebar(settings: Dict) -> Tuple[float, str, str, str, int, float, bool, str, int, str, str, int]:
     with st.sidebar:
         st.header("Seaded")
 
@@ -712,6 +759,9 @@ def render_desktop_sidebar(settings: Dict) -> Tuple[float, str, str, str, int, f
         position_mode = st.selectbox("Uute ostude jaotus", options=["Equal weight", "Use available cash evenly"], index=0 if settings.get("position_mode", "Equal weight") == "Equal weight" else 1)
         max_new_positions_per_day = st.number_input("Maksimaalne uute positsioonide arv päevas", min_value=1, max_value=20, value=int(settings.get("max_new_positions_per_day", 3)), step=1)
         min_cash_buffer_pct = st.slider("Raha puhver osakaaluna portfellist", min_value=0.0, max_value=0.30, value=float(settings.get("min_cash_buffer_pct", 0.05)), step=0.01)
+
+        signal_strictness = st.slider("Analüüsi rangus", min_value=1, max_value=4, value=int(settings.get("signal_strictness", 3)), step=1)
+        st.caption(f"{get_strictness_label(signal_strictness)} — leebe annab rohkem signaale, range vähem aga tugevamaid.")
 
         st.subheader("E-maili teavitus")
         notifications_enabled = st.checkbox("Teavitused lubatud", value=bool(settings.get("notifications_enabled", False)))
@@ -733,10 +783,11 @@ def render_desktop_sidebar(settings: Dict) -> Tuple[float, str, str, str, int, f
         int(smtp_port),
         smtp_username,
         smtp_password,
+        int(signal_strictness),
     )
 
 
-def render_mobile_header(settings: Dict) -> Tuple[float, str, str, str, int, float, bool, str, int, str, str]:
+def render_mobile_header(settings: Dict) -> Tuple[float, str, str, str, int, float, bool, str, int, str, str, int]:
     investable_amount = float(settings.get("investable_amount", 10000.0))
     benchmark = str(settings.get("benchmark", DEFAULT_BENCHMARK)).upper().strip()
     universe_text = ", ".join(settings.get("user_universe", DEFAULT_UNIVERSE))
@@ -748,8 +799,10 @@ def render_mobile_header(settings: Dict) -> Tuple[float, str, str, str, int, flo
     smtp_port = int(settings.get("smtp_port", 587))
     smtp_username = str(settings.get("smtp_username", ""))
     smtp_password = str(settings.get("smtp_password", ""))
+    signal_strictness = int(settings.get("signal_strictness", 3))
 
-    st.caption("Mobiilivaade: näitan ainult scan nuppu, portfelli seisu ja scan'i järel soovitusi.")
+    st.caption("Mobiilivaade: ainult scan nupp, portfelli seis ja scan'i järel soovitused.")
+    st.caption(f"Analüüsi rangus: {get_strictness_label(signal_strictness)}")
     return (
         investable_amount,
         benchmark,
@@ -762,6 +815,7 @@ def render_mobile_header(settings: Dict) -> Tuple[float, str, str, str, int, flo
         smtp_port,
         smtp_username,
         smtp_password,
+        signal_strictness,
     )
 
 
@@ -778,6 +832,7 @@ def save_ui_settings(
     smtp_port: int,
     smtp_username: str,
     smtp_password: str,
+    signal_strictness: int,
 ) -> Dict:
     parsed_universe = [x.strip().upper() for x in universe_text.split(",") if x.strip()]
     settings.update({
@@ -792,6 +847,7 @@ def save_ui_settings(
         "smtp_port": int(smtp_port),
         "smtp_username": smtp_username,
         "smtp_password": smtp_password,
+        "signal_strictness": int(signal_strictness),
     })
     save_settings(settings)
     return settings
@@ -882,6 +938,7 @@ def run_streamlit_app() -> None:
             smtp_port,
             smtp_username,
             smtp_password,
+            signal_strictness,
         ) = render_desktop_sidebar(settings)
     else:
         (
@@ -896,13 +953,14 @@ def run_streamlit_app() -> None:
             smtp_port,
             smtp_username,
             smtp_password,
+            signal_strictness,
         ) = render_mobile_header(settings)
 
     render_portfolio_overview(portfolio)
     st.write("")
 
     if st.session_state["view_mode"] == "desktop":
-        left, right = st.columns([1, 1])
+        left, _ = st.columns([1, 1])
         with left:
             if st.button("Salvesta seaded", use_container_width=True):
                 save_ui_settings(
@@ -918,6 +976,7 @@ def run_streamlit_app() -> None:
                     smtp_port,
                     smtp_username,
                     smtp_password,
+                    signal_strictness,
                 )
                 if not portfolio.get("positions") and not portfolio.get("closed_positions"):
                     portfolio["cash"] = float(investable_amount)
@@ -944,6 +1003,7 @@ def run_streamlit_app() -> None:
                 smtp_port,
                 smtp_username,
                 smtp_password,
+                signal_strictness,
             )
 
             if not portfolio.get("positions") and not portfolio.get("closed_positions"):
@@ -958,7 +1018,11 @@ def run_streamlit_app() -> None:
             if not signals.empty and signals["reason"].astype(str).str.contains("benchmark unavailable", case=False, na=False).any():
                 st.warning("Benchmark ei laadinud ära. Scan jooksis edasi NEUTRAL režiimis.")
 
-            st.success(f"Skänn tehtud. Turu režiim: {result['regime']}. Teavitused: {result['notification_message']}")
+            st.success(
+                f"Skänn tehtud. Turu režiim: {result['regime']}. "
+                f"Rangus: {get_strictness_label(signal_strictness)}. "
+                f"Teavitused: {result['notification_message']}"
+            )
         except Exception as exc:
             st.error(f"Skänn ebaõnnestus: {exc}")
 
