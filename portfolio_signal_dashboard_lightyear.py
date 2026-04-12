@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import math
 import json
+import math
 import smtplib
 from datetime import date, datetime
 from email.mime.text import MIMEText
@@ -15,7 +15,7 @@ import streamlit as st
 import yfinance as yf
 
 
-# VERSION 2026-04-11-C
+# VERSION 2026-04-12-MOBILE-TOGGLE
 
 APP_DIR = Path(".")
 STATE_DIR = APP_DIR / "portfolio_state"
@@ -53,7 +53,6 @@ def default_settings() -> Dict:
         "smtp_port": 587,
         "smtp_username": "",
         "smtp_password": "",
-        "strict_lightyear_only": False,
     }
 
 
@@ -220,6 +219,7 @@ def score_symbol(symbol: str, df: pd.DataFrame, benchmark_df: Optional[pd.DataFr
 
     price = float(latest["Close"])
     avg_dollar_vol = float(latest["DollarVol20"]) if pd.notna(latest["DollarVol20"]) else np.nan
+
     if price < 5:
         return {"symbol": symbol, "action": "SKIP", "score": np.nan, "reason": "price too low"}
     if np.isnan(avg_dollar_vol) or avg_dollar_vol < 10_000_000:
@@ -500,7 +500,15 @@ def accept_buy(portfolio: Dict, symbol: str, quantity: int, price: float, reason
     }
     append_csv_row(
         TRANSACTIONS_FILE,
-        {"timestamp": datetime.now().isoformat(), "type": "BUY", "symbol": symbol, "quantity": quantity, "price": round(price, 4), "gross_amount": cost, "reason": reason},
+        {
+            "timestamp": datetime.now().isoformat(),
+            "type": "BUY",
+            "symbol": symbol,
+            "quantity": quantity,
+            "price": round(price, 4),
+            "gross_amount": cost,
+            "reason": reason,
+        },
     )
     save_portfolio(portfolio)
     return f"Ost aktsepteeritud: {symbol}, {quantity} tk hinnaga {price:.2f}."
@@ -531,7 +539,16 @@ def accept_sell(portfolio: Dict, symbol: str, price: float, reason: str, score: 
 
     append_csv_row(
         TRANSACTIONS_FILE,
-        {"timestamp": datetime.now().isoformat(), "type": "SELL", "symbol": symbol, "quantity": qty, "price": round(price, 4), "gross_amount": proceeds, "reason": reason, "realized_pnl": pnl},
+        {
+            "timestamp": datetime.now().isoformat(),
+            "type": "SELL",
+            "symbol": symbol,
+            "quantity": qty,
+            "price": round(price, 4),
+            "gross_amount": proceeds,
+            "reason": reason,
+            "realized_pnl": pnl,
+        },
     )
     save_portfolio(portfolio)
     return f"Müük aktsepteeritud: {symbol}, {qty} tk hinnaga {price:.2f}, P/L {pnl:.2f}."
@@ -555,7 +572,11 @@ def send_email_message(host: str, port: int, username: str, password: str, to_ad
 
 
 def build_notification_message(regime: str, proposals: pd.DataFrame, settings: Dict) -> str:
-    lines = [f"Daily portfolio scan — {date.today().isoformat()}", f"Benchmark: {settings.get('benchmark')} | Regime: {regime}", ""]
+    lines = [
+        f"Daily portfolio scan — {date.today().isoformat()}",
+        f"Benchmark: {settings.get('benchmark')} | Regime: {regime}",
+        "",
+    ]
     for label in ["BUY", "SELL", "HOLD"]:
         subset = proposals[proposals["proposal_type"] == label]
         lines.append(label)
@@ -652,15 +673,36 @@ def proposal_table_df(proposals: pd.DataFrame) -> pd.DataFrame:
     return proposals[[c for c in cols if c in proposals.columns]].copy()
 
 
-def run_streamlit_app() -> None:
-    st.set_page_config(page_title="Portfolio Signal Dashboard V2", layout="wide")
-    st.title("Portfolio Signal Dashboard V2")
-    st.caption("Lühendatud ja robustsem versioon.")
+def is_probably_mobile() -> bool:
+    ua = st.query_params.get("ua", "")
+    if isinstance(ua, list):
+        ua = " ".join(ua)
+    ua = str(ua).lower()
+    mobile_markers = ["iphone", "android", "mobile"]
+    return any(marker in ua for marker in mobile_markers)
 
-    settings = load_settings()
-    portfolio = load_portfolio()
-    normalize_positions(portfolio)
 
+def init_view_mode() -> None:
+    if "view_mode" not in st.session_state:
+        st.session_state["view_mode"] = "mobile" if is_probably_mobile() else "desktop"
+
+
+def toggle_view_mode() -> None:
+    st.session_state["view_mode"] = "desktop" if st.session_state["view_mode"] == "mobile" else "mobile"
+
+
+def render_top_bar() -> None:
+    left, right = st.columns([5, 1])
+    with left:
+        st.title("Portfolio Signal Dashboard V2")
+    with right:
+        label = "Desktop vaade" if st.session_state["view_mode"] == "mobile" else "Mobiilivaade"
+        if st.button(label, use_container_width=True):
+            toggle_view_mode()
+            st.rerun()
+
+
+def render_desktop_sidebar(settings: Dict) -> Tuple[float, str, str, str, int, float, bool, str, int, str, str]:
     with st.sidebar:
         st.header("Seaded")
 
@@ -679,28 +721,83 @@ def run_streamlit_app() -> None:
         smtp_username = st.text_input("SMTP username", value=str(settings.get("smtp_username", "")))
         smtp_password = st.text_input("SMTP password", value=str(settings.get("smtp_password", "")), type="password")
 
-        if st.button("Salvesta seaded", use_container_width=True):
-            parsed_universe = [x.strip().upper() for x in universe_text.split(",") if x.strip()]
-            settings.update({
-                "investable_amount": float(investable_amount),
-                "benchmark": benchmark,
-                "user_universe": parsed_universe,
-                "position_mode": position_mode,
-                "max_new_positions_per_day": int(max_new_positions_per_day),
-                "min_cash_buffer_pct": float(min_cash_buffer_pct),
-                "notifications_enabled": bool(notifications_enabled),
-                "smtp_host": smtp_host,
-                "smtp_port": int(smtp_port),
-                "smtp_username": smtp_username,
-                "smtp_password": smtp_password,
-            })
-            save_settings(settings)
-            if not portfolio.get("positions") and not portfolio.get("closed_positions"):
-                portfolio["cash"] = float(investable_amount)
-                portfolio["initial_capital"] = float(investable_amount)
-                save_portfolio(portfolio)
-            st.success("Seaded salvestatud.")
+    return (
+        investable_amount,
+        benchmark,
+        universe_text,
+        position_mode,
+        int(max_new_positions_per_day),
+        float(min_cash_buffer_pct),
+        bool(notifications_enabled),
+        smtp_host,
+        int(smtp_port),
+        smtp_username,
+        smtp_password,
+    )
 
+
+def render_mobile_header(settings: Dict) -> Tuple[float, str, str, str, int, float, bool, str, int, str, str]:
+    investable_amount = float(settings.get("investable_amount", 10000.0))
+    benchmark = str(settings.get("benchmark", DEFAULT_BENCHMARK)).upper().strip()
+    universe_text = ", ".join(settings.get("user_universe", DEFAULT_UNIVERSE))
+    position_mode = settings.get("position_mode", "Equal weight")
+    max_new_positions_per_day = int(settings.get("max_new_positions_per_day", 3))
+    min_cash_buffer_pct = float(settings.get("min_cash_buffer_pct", 0.05))
+    notifications_enabled = bool(settings.get("notifications_enabled", False))
+    smtp_host = str(settings.get("smtp_host", "smtp.gmail.com"))
+    smtp_port = int(settings.get("smtp_port", 587))
+    smtp_username = str(settings.get("smtp_username", ""))
+    smtp_password = str(settings.get("smtp_password", ""))
+
+    st.caption("Mobiilivaade: näitan ainult scan nuppu, portfelli seisu ja scan'i järel soovitusi.")
+    return (
+        investable_amount,
+        benchmark,
+        universe_text,
+        position_mode,
+        max_new_positions_per_day,
+        min_cash_buffer_pct,
+        notifications_enabled,
+        smtp_host,
+        smtp_port,
+        smtp_username,
+        smtp_password,
+    )
+
+
+def save_ui_settings(
+    settings: Dict,
+    investable_amount: float,
+    benchmark: str,
+    universe_text: str,
+    position_mode: str,
+    max_new_positions_per_day: int,
+    min_cash_buffer_pct: float,
+    notifications_enabled: bool,
+    smtp_host: str,
+    smtp_port: int,
+    smtp_username: str,
+    smtp_password: str,
+) -> Dict:
+    parsed_universe = [x.strip().upper() for x in universe_text.split(",") if x.strip()]
+    settings.update({
+        "investable_amount": float(investable_amount),
+        "benchmark": benchmark,
+        "user_universe": parsed_universe,
+        "position_mode": position_mode,
+        "max_new_positions_per_day": int(max_new_positions_per_day),
+        "min_cash_buffer_pct": float(min_cash_buffer_pct),
+        "notifications_enabled": bool(notifications_enabled),
+        "smtp_host": smtp_host,
+        "smtp_port": int(smtp_port),
+        "smtp_username": smtp_username,
+        "smtp_password": smtp_password,
+    })
+    save_settings(settings)
+    return settings
+
+
+def render_portfolio_overview(portfolio: Dict) -> None:
     c1, c2, c3, c4 = st.columns(4)
     pv = estimate_portfolio_value(portfolio)
     cash = float(portfolio.get("cash", 0.0))
@@ -709,27 +806,150 @@ def run_streamlit_app() -> None:
     c3.metric("Investeeritud", fmt_money(pv - cash))
     c4.metric("Avatud positsioone", str(len(portfolio.get("positions", {}))))
 
+
+def render_proposals(proposals: pd.DataFrame, portfolio: Dict) -> None:
+    st.subheader("Soovitused")
+
+    if proposals.empty:
+        st.write("Täna ettepanekuid veel ei ole.")
+        return
+
+    st.dataframe(proposal_table_df(proposals), use_container_width=True, hide_index=True)
+
+    buy_df = proposals[proposals["proposal_type"] == "BUY"].sort_values("score", ascending=False)
+    sell_df = proposals[proposals["proposal_type"] == "SELL"].sort_values("score", ascending=True)
+
+    if not buy_df.empty:
+        st.markdown("**BUY**")
+        for _, row in buy_df.iterrows():
+            sym = str(row["symbol"])
+            with st.container(border=True):
+                st.write(f"{sym} | score {row['score']} | signal price {row.get('signal_price', row['close'])} | hind {row['close']}")
+                st.write(f"Kogus: {int(row['quantity'])} | Kulu: {fmt_money(abs(float(row['estimated_cash_impact'])))}")
+                st.write(f"Põhjus: {row['reason']}")
+                if st.button(f"Aksepteeri BUY {sym}", key=f"buy_{sym}", use_container_width=True):
+                    msg = accept_buy(
+                        portfolio,
+                        sym,
+                        int(row["quantity"]),
+                        float(row["close"]),
+                        str(row.get("reason", "")),
+                        None if pd.isna(row.get("score")) else float(row.get("score")),
+                        None if pd.isna(row.get("stop_reference")) else float(row.get("stop_reference")),
+                    )
+                    st.success(msg)
+                    st.rerun()
+
+    if not sell_df.empty:
+        st.markdown("**SELL**")
+        for _, row in sell_df.iterrows():
+            sym = str(row["symbol"])
+            with st.container(border=True):
+                st.write(f"{sym} | score {row['score']} | signal price {row.get('signal_price', row['close'])} | hind {row['close']}")
+                st.write(f"Kogus: {int(row['quantity'])} | Laekumine: {fmt_money(float(row['estimated_cash_impact']))}")
+                st.write(f"Põhjus: {row['reason']}")
+                if st.button(f"Aksepteeri SELL {sym}", key=f"sell_{sym}", use_container_width=True):
+                    msg = accept_sell(
+                        portfolio,
+                        sym,
+                        float(row["close"]),
+                        str(row.get("reason", "")),
+                        None if pd.isna(row.get("score")) else float(row.get("score")),
+                    )
+                    st.success(msg)
+                    st.rerun()
+
+
+def run_streamlit_app() -> None:
+    st.set_page_config(page_title="Portfolio Signal Dashboard V2", layout="wide")
+    init_view_mode()
+    render_top_bar()
+
+    settings = load_settings()
+    portfolio = load_portfolio()
+    normalize_positions(portfolio)
+
+    if st.session_state["view_mode"] == "desktop":
+        (
+            investable_amount,
+            benchmark,
+            universe_text,
+            position_mode,
+            max_new_positions_per_day,
+            min_cash_buffer_pct,
+            notifications_enabled,
+            smtp_host,
+            smtp_port,
+            smtp_username,
+            smtp_password,
+        ) = render_desktop_sidebar(settings)
+    else:
+        (
+            investable_amount,
+            benchmark,
+            universe_text,
+            position_mode,
+            max_new_positions_per_day,
+            min_cash_buffer_pct,
+            notifications_enabled,
+            smtp_host,
+            smtp_port,
+            smtp_username,
+            smtp_password,
+        ) = render_mobile_header(settings)
+
+    render_portfolio_overview(portfolio)
+    st.write("")
+
+    if st.session_state["view_mode"] == "desktop":
+        left, right = st.columns([1, 1])
+        with left:
+            if st.button("Salvesta seaded", use_container_width=True):
+                save_ui_settings(
+                    settings,
+                    investable_amount,
+                    benchmark,
+                    universe_text,
+                    position_mode,
+                    max_new_positions_per_day,
+                    min_cash_buffer_pct,
+                    notifications_enabled,
+                    smtp_host,
+                    smtp_port,
+                    smtp_username,
+                    smtp_password,
+                )
+                if not portfolio.get("positions") and not portfolio.get("closed_positions"):
+                    portfolio["cash"] = float(investable_amount)
+                    portfolio["initial_capital"] = float(investable_amount)
+                    save_portfolio(portfolio)
+                st.success("Seaded salvestatud.")
+
     run_scan_now = st.button("Run daily scan", type="primary", use_container_width=True)
     signals = pd.DataFrame()
     proposals = pd.DataFrame()
 
     if run_scan_now:
         try:
-            parsed_universe = [x.strip().upper() for x in universe_text.split(",") if x.strip()]
-            settings.update({
-                "investable_amount": float(investable_amount),
-                "benchmark": benchmark,
-                "user_universe": parsed_universe,
-                "position_mode": position_mode,
-                "max_new_positions_per_day": int(max_new_positions_per_day),
-                "min_cash_buffer_pct": float(min_cash_buffer_pct),
-                "notifications_enabled": bool(notifications_enabled),
-                "smtp_host": smtp_host,
-                "smtp_port": int(smtp_port),
-                "smtp_username": smtp_username,
-                "smtp_password": smtp_password,
-            })
-            save_settings(settings)
+            settings = save_ui_settings(
+                settings,
+                investable_amount,
+                benchmark,
+                universe_text,
+                position_mode,
+                max_new_positions_per_day,
+                min_cash_buffer_pct,
+                notifications_enabled,
+                smtp_host,
+                smtp_port,
+                smtp_username,
+                smtp_password,
+            )
+
+            if not portfolio.get("positions") and not portfolio.get("closed_positions"):
+                portfolio["cash"] = float(investable_amount)
+                portfolio["initial_capital"] = float(investable_amount)
+                save_portfolio(portfolio)
 
             result = execute_daily_job(settings, portfolio)
             signals = result["signals"]
@@ -749,14 +969,11 @@ def run_streamlit_app() -> None:
         except Exception:
             pass
 
-    st.subheader("Tänased ettepanekud")
-    if proposals.empty:
-        st.write("Täna ettepanekuid veel ei ole.")
-    else:
-        st.dataframe(proposal_table_df(proposals), use_container_width=True, hide_index=True)
-
     st.subheader("Portfelli seis")
     st.dataframe(portfolio_snapshot_df(portfolio), use_container_width=True, hide_index=True)
+
+    if run_scan_now or not proposals.empty:
+        render_proposals(proposals, portfolio)
 
 
 if __name__ == "__main__":
