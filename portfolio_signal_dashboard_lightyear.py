@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import smtplib
+from collections import Counter
 from datetime import date, datetime
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -15,7 +16,7 @@ import streamlit as st
 import yfinance as yf
 
 
-# VERSION 2026-04-12-TOP10
+# VERSION 2026-04-12-DIAGNOSTIC
 
 APP_DIR = Path(".")
 STATE_DIR = APP_DIR / "portfolio_state"
@@ -29,6 +30,7 @@ TRANSACTIONS_FILE = STATE_DIR / "transactions.csv"
 FIXED_NOTIFICATION_EMAIL = "marko.johanson@icloud.com"
 
 DEFAULT_BENCHMARK = "SPY"
+MIN_AVG_DOLLAR_VOLUME = 1_000_000  # enne 10M, nüüd leebem
 DEFAULT_UNIVERSE = [
     "SPY", "QQQ", "IWM", "DIA",
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU",
@@ -249,7 +251,7 @@ def score_symbol(
 
     if price < 5:
         return {"symbol": symbol, "action": "SKIP", "score": np.nan, "reason": "price too low"}
-    if np.isnan(avg_dollar_vol) or avg_dollar_vol < 10_000_000:
+    if np.isnan(avg_dollar_vol) or avg_dollar_vol < MIN_AVG_DOLLAR_VOLUME:
         return {"symbol": symbol, "action": "SKIP", "score": np.nan, "reason": "insufficient liquidity"}
 
     rs = relative_strength_score(x, benchmark_df)
@@ -414,6 +416,20 @@ def summarize_signals(signals: pd.DataFrame) -> Dict[str, int]:
         "SELL": int(counts.get("SELL", 0)),
         "SKIP": int(counts.get("SKIP", 0)),
     }
+
+
+def summarize_skip_reasons(signals: pd.DataFrame) -> pd.DataFrame:
+    if signals.empty or "action" not in signals.columns or "reason" not in signals.columns:
+        return pd.DataFrame()
+
+    skip_df = signals[signals["action"] == "SKIP"].copy()
+    if skip_df.empty:
+        return pd.DataFrame()
+
+    reasons = skip_df["reason"].fillna("unknown").astype(str).str.strip()
+    counts = Counter(reasons)
+    out = pd.DataFrame({"reason": list(counts.keys()), "count": list(counts.values())})
+    return out.sort_values("count", ascending=False).reset_index(drop=True)
 
 
 def top_signals_df(signals: pd.DataFrame, n: int = 10) -> pd.DataFrame:
@@ -897,6 +913,15 @@ def render_signal_summary(signals: pd.DataFrame) -> None:
     c4.metric("SKIP", counts["SKIP"])
 
 
+def render_skip_reasons(signals: pd.DataFrame) -> None:
+    st.subheader("SKIP põhjused")
+    skip_df = summarize_skip_reasons(signals)
+    if skip_df.empty:
+        st.write("SKIP põhjuseid ei ole.")
+        return
+    st.dataframe(skip_df.head(10), use_container_width=True, hide_index=True)
+
+
 def render_top_signals(signals: pd.DataFrame) -> None:
     st.subheader("Top 10 signaalid täna")
     top_df = top_signals_df(signals, 10)
@@ -1081,11 +1106,13 @@ def run_streamlit_app() -> None:
 
     if not signals.empty:
         render_signal_summary(signals)
+        render_skip_reasons(signals)
         render_top_signals(signals)
     elif HISTORY_FILE.exists():
         try:
             hist = pd.read_csv(HISTORY_FILE)
             render_signal_summary(hist)
+            render_skip_reasons(hist)
             render_top_signals(hist)
         except Exception:
             pass
