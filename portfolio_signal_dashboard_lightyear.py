@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import math
 import smtplib
+import urllib.parse
+import urllib.request
 from collections import Counter
 from datetime import date, datetime
 from email.mime.text import MIMEText
@@ -13,10 +15,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
-import yfinance as yf
 
 
-# VERSION 2026-04-13-DATASOURCE-SELFTEST
+# VERSION 2026-04-13-ALPHAVANTAGE
 
 APP_DIR = Path(".")
 STATE_DIR = APP_DIR / "portfolio_state"
@@ -30,9 +31,7 @@ TRANSACTIONS_FILE = STATE_DIR / "transactions.csv"
 FIXED_NOTIFICATION_EMAIL = "marko.johanson@icloud.com"
 
 DEFAULT_BENCHMARK = "SPY"
-MIN_AVG_DOLLAR_VOLUME = 1_000_000
-DEFAULT_PERIOD = "6mo"
-DEFAULT_INTERVAL = "1d"
+MIN_AVG_DOLLAR_VOLUME = 500_000.0
 SELFTEST_SYMBOLS = ["SPY", "AAPL", "MSFT"]
 
 DEFAULT_UNIVERSE = [
@@ -82,6 +81,7 @@ def default_settings() -> Dict:
         "smtp_username": "",
         "smtp_password": "",
         "signal_strictness": 3,
+        "alpha_vantage_api_key": "",
     }
 
 
@@ -154,12 +154,12 @@ def unique_symbols(symbols: List[str]) -> List[str]:
 
 def get_thresholds(strictness: int) -> Tuple[float, float]:
     mapping = {
-        1: (3.0, -2.0),
-        2: (4.0, -3.0),
-        3: (5.0, -4.0),
-        4: (6.0, -5.0),
+        1: (2.5, -2.0),
+        2: (3.5, -3.0),
+        3: (4.5, -4.0),
+        4: (5.5, -5.0),
     }
-    return mapping.get(strictness, (5.0, -4.0))
+    return mapping.get(strictness, (4.5, -4.0))
 
 
 def get_strictness_label(strictness: int) -> str:
@@ -172,56 +172,79 @@ def get_strictness_label(strictness: int) -> str:
     return labels.get(strictness, "Range")
 
 
-def download_symbol_history(symbol: str, period: str = DEFAULT_PERIOD, interval: str = DEFAULT_INTERVAL) -> pd.DataFrame:
+def alpha_vantage_url(symbol: str, api_key: str) -> str:
+    params = {
+        "function": "TIME_SERIES_DAILY",
+        "symbol": symbol,
+        "outputsize": "compact",
+        "datatype": "json",
+        "apikey": api_key,
+    }
+    return "https://www.alphavantage.co/query?" + urllib.parse.urlencode(params)
+
+
+def download_symbol_history(symbol: str, api_key: str, timeout: int = 20) -> pd.DataFrame:
+    if not api_key.strip():
+        return pd.DataFrame()
+
+    url = alpha_vantage_url(symbol, api_key)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        },
+    )
+
     try:
-        df = yf.download(
-            symbol,
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+        payload = json.loads(raw)
     except Exception:
         return pd.DataFrame()
 
-    if df is None or df.empty:
+    series = payload.get("Time Series (Daily)")
+    if not isinstance(series, dict) or not series:
         return pd.DataFrame()
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ["_".join([str(x) for x in tup if str(x)]).strip("_") for tup in df.columns]
+    rows = []
+    for dt, values in series.items():
+        try:
+            rows.append(
+                {
+                    "Date": pd.to_datetime(dt),
+                    "Open": float(values["1. open"]),
+                    "High": float(values["2. high"]),
+                    "Low": float(values["3. low"]),
+                    "Close": float(values["4. close"]),
+                    "Volume": float(values["5. volume"]),
+                }
+            )
+        except Exception:
+            continue
 
-    cols = {c.lower(): c for c in df.columns}
-    required = ["open", "high", "low", "close", "volume"]
-    if not all(k in cols for k in required):
+    if not rows:
         return pd.DataFrame()
 
-    out = df[[cols["open"], cols["high"], cols["low"], cols["close"], cols["volume"]]].copy()
-    out.columns = ["Open", "High", "Low", "Close", "Volume"]
-    out.index = pd.to_datetime(out.index)
-    out = out.sort_index().dropna()
-
-    if out.empty:
-        return pd.DataFrame()
-
-    return out
+    df = pd.DataFrame(rows).set_index("Date").sort_index()
+    return df.dropna()
 
 
-def download_universe_data(symbols: List[str]) -> Dict[str, pd.DataFrame]:
+def download_universe_data(symbols: List[str], api_key: str) -> Dict[str, pd.DataFrame]:
     out: Dict[str, pd.DataFrame] = {}
     for symbol in unique_symbols(symbols):
-        df = download_symbol_history(symbol, period=DEFAULT_PERIOD, interval=DEFAULT_INTERVAL)
+        df = download_symbol_history(symbol, api_key=api_key)
         if not df.empty:
             out[symbol] = df
     return out
 
 
-def run_data_source_selftest() -> Dict:
+def run_data_source_selftest(api_key: str) -> Dict:
     loaded = {}
     failures = []
 
     for symbol in SELFTEST_SYMBOLS:
-        df = download_symbol_history(symbol, period="3mo", interval="1d")
+        df = download_symbol_history(symbol, api_key=api_key)
         if df.empty:
             failures.append(symbol)
         else:
@@ -253,7 +276,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
     x["SMA20"] = x["Close"].rolling(20).mean()
     x["SMA50"] = x["Close"].rolling(50).mean()
-    x["SMA200"] = x["Close"].rolling(200).mean()
     x["AvgVol20"] = x["Volume"].rolling(20).mean()
     x["DollarVol20"] = x["Close"] * x["AvgVol20"]
     x["ATR14"] = compute_atr(x, 14)
@@ -268,20 +290,20 @@ def compute_market_regime(benchmark_df: Optional[pd.DataFrame]) -> str:
         return "NEUTRAL"
 
     x = benchmark_df.copy()
+    x["SMA20"] = x["Close"].rolling(20).mean()
     x["SMA50"] = x["Close"].rolling(50).mean()
-    x["SMA200"] = x["Close"].rolling(200).mean()
     latest = x.iloc[-1]
 
-    if pd.isna(latest["SMA50"]) or pd.isna(latest["SMA200"]):
+    if pd.isna(latest["SMA20"]) or pd.isna(latest["SMA50"]):
         return "NEUTRAL"
-    if latest["Close"] > latest["SMA200"] and latest["SMA50"] > latest["SMA200"]:
+    if latest["Close"] > latest["SMA50"] and latest["SMA20"] > latest["SMA50"]:
         return "BULL"
-    if latest["Close"] < latest["SMA200"] and latest["SMA50"] < latest["SMA200"]:
+    if latest["Close"] < latest["SMA50"] and latest["SMA20"] < latest["SMA50"]:
         return "BEAR"
     return "NEUTRAL"
 
 
-def relative_strength_score(symbol_df: pd.DataFrame, benchmark_df: Optional[pd.DataFrame], lookback: int = 63) -> float:
+def relative_strength_score(symbol_df: pd.DataFrame, benchmark_df: Optional[pd.DataFrame], lookback: int = 40) -> float:
     if benchmark_df is None or benchmark_df.empty or "Close" not in benchmark_df.columns:
         return np.nan
 
@@ -310,7 +332,7 @@ def score_symbol(
 ) -> Dict:
     x = add_indicators(df)
 
-    if len(x) < 120:
+    if len(x) < 70:
         return {"symbol": symbol, "action": "SKIP", "score": np.nan, "reason": "not enough history"}
 
     latest = x.iloc[-1]
@@ -339,31 +361,26 @@ def score_symbol(
         score -= 1.0
 
     if pd.notna(latest["SMA50"]) and price > latest["SMA50"]:
-        score += 1.5
-        reasons.append("above SMA50")
-    else:
-        score -= 1.5
-
-    if pd.notna(latest["SMA200"]) and price > latest["SMA200"]:
         score += 2.0
-        reasons.append("above SMA200")
+        reasons.append("above SMA50")
     else:
         score -= 2.0
 
     if pd.notna(mom63):
-        if mom63 > 0.15:
+        if mom63 > 0.12:
             score += 2.0
-            reasons.append("strong 3m momentum")
-        elif mom63 > 0.05:
+            reasons.append("strong momentum")
+        elif mom63 > 0.04:
             score += 1.0
-        elif mom63 < -0.10:
+        elif mom63 < -0.08:
             score -= 2.0
         elif mom63 < 0:
             score -= 1.0
 
     if pd.notna(rs):
-        if rs > 0.10:
+        if rs > 0.08:
             score += 1.5
+            reasons.append("relative strength")
         elif rs < -0.05:
             score -= 1.5
 
@@ -375,23 +392,23 @@ def score_symbol(
 
     if pd.notna(latest["AvgVol20"]) and latest["AvgVol20"] > 0:
         vol_ratio = float(latest["Volume"] / latest["AvgVol20"])
-        if vol_ratio > 1.3 and price > float(prev["Close"]):
+        if vol_ratio > 1.2 and price > float(prev["Close"]):
             score += 1.0
-        elif vol_ratio > 1.3 and price < float(prev["Close"]):
+        elif vol_ratio > 1.2 and price < float(prev["Close"]):
             score -= 1.0
     else:
         vol_ratio = np.nan
 
     if pd.notna(atr_pct):
-        if atr_pct > 0.08:
+        if atr_pct > 0.10:
             score -= 1.0
-        elif atr_pct < 0.03:
+        elif atr_pct < 0.04:
             score += 0.5
 
     if regime == "BULL" and score > 0:
         score += 0.5
     elif regime == "BEAR":
-        score -= 1.5
+        score -= 1.0
 
     buy_threshold, sell_threshold = get_thresholds(strictness)
 
@@ -403,24 +420,24 @@ def score_symbol(
 
     confidence = "Low"
     if strictness == 1:
-        if abs(score) >= 5.5:
+        if abs(score) >= 4.5:
+            confidence = "High"
+        elif abs(score) >= 3.5:
+            confidence = "Medium"
+    elif strictness == 2:
+        if abs(score) >= 5.0:
             confidence = "High"
         elif abs(score) >= 4.0:
             confidence = "Medium"
-    elif strictness == 2:
-        if abs(score) >= 6.0:
+    elif strictness == 3:
+        if abs(score) >= 5.5:
             confidence = "High"
         elif abs(score) >= 4.5:
             confidence = "Medium"
-    elif strictness == 3:
-        if abs(score) >= 6.5:
+    else:
+        if abs(score) >= 6.0:
             confidence = "High"
         elif abs(score) >= 5.0:
-            confidence = "Medium"
-    else:
-        if abs(score) >= 7.0:
-            confidence = "High"
-        elif abs(score) >= 5.5:
             confidence = "Medium"
 
     stop_ref = np.nan
@@ -445,10 +462,15 @@ def score_symbol(
     }
 
 
-def run_daily_scan(universe: List[str], benchmark: str, strictness: int) -> Tuple[str, pd.DataFrame, Dict[str, pd.DataFrame], List[str]]:
+def run_daily_scan(
+    universe: List[str],
+    benchmark: str,
+    strictness: int,
+    api_key: str,
+) -> Tuple[str, pd.DataFrame, Dict[str, pd.DataFrame], List[str]]:
     universe = unique_symbols(universe)
     symbols = unique_symbols(universe + [benchmark])
-    data = download_universe_data(symbols)
+    data = download_universe_data(symbols, api_key=api_key)
 
     benchmark_df = data.get(benchmark)
     regime = compute_market_regime(benchmark_df)
@@ -764,7 +786,8 @@ def send_notifications(settings: Dict, regime: str, proposals: pd.DataFrame) -> 
 
 
 def execute_daily_job(settings: Dict, portfolio: Dict) -> Dict:
-    selftest = run_data_source_selftest()
+    api_key = str(settings.get("alpha_vantage_api_key", "")).strip()
+    selftest = run_data_source_selftest(api_key)
     if not selftest["ok"]:
         return {
             "regime": "UNKNOWN",
@@ -784,7 +807,12 @@ def execute_daily_job(settings: Dict, portfolio: Dict) -> Dict:
     if benchmark not in universe:
         universe.append(benchmark)
 
-    regime, signals, data, missing_symbols = run_daily_scan(universe, benchmark, strictness)
+    regime, signals, data, missing_symbols = run_daily_scan(
+        universe=universe,
+        benchmark=benchmark,
+        strictness=strictness,
+        api_key=api_key,
+    )
 
     settings["last_scan_date"] = str(date.today())
     save_settings(settings)
@@ -877,7 +905,7 @@ def render_top_bar() -> None:
             st.rerun()
 
 
-def render_desktop_sidebar(settings: Dict) -> Tuple[float, str, str, str, int, float, bool, str, int, str, str, int]:
+def render_desktop_sidebar(settings: Dict) -> Tuple[float, str, str, str, int, float, bool, str, int, str, str, int, str]:
     with st.sidebar:
         st.header("Seaded")
 
@@ -890,6 +918,9 @@ def render_desktop_sidebar(settings: Dict) -> Tuple[float, str, str, str, int, f
 
         signal_strictness = st.slider("Analüüsi rangus", min_value=1, max_value=4, value=int(settings.get("signal_strictness", 3)), step=1)
         st.caption(f"{get_strictness_label(signal_strictness)} — leebe annab rohkem signaale, range vähem aga tugevamaid.")
+
+        st.subheader("Andmeallikas")
+        api_key = st.text_input("Alpha Vantage API key", value=str(settings.get("alpha_vantage_api_key", "")), type="password")
 
         st.subheader("E-maili teavitus")
         notifications_enabled = st.checkbox("Teavitused lubatud", value=bool(settings.get("notifications_enabled", False)))
@@ -912,10 +943,11 @@ def render_desktop_sidebar(settings: Dict) -> Tuple[float, str, str, str, int, f
         smtp_username,
         smtp_password,
         int(signal_strictness),
+        api_key,
     )
 
 
-def render_mobile_header(settings: Dict) -> Tuple[float, str, str, str, int, float, bool, str, int, str, str, int]:
+def render_mobile_header(settings: Dict) -> Tuple[float, str, str, str, int, float, bool, str, int, str, str, int, str]:
     investable_amount = float(settings.get("investable_amount", 10000.0))
     benchmark = str(settings.get("benchmark", DEFAULT_BENCHMARK)).upper().strip()
     universe_text = ", ".join(settings.get("user_universe", DEFAULT_UNIVERSE))
@@ -928,6 +960,7 @@ def render_mobile_header(settings: Dict) -> Tuple[float, str, str, str, int, flo
     smtp_username = str(settings.get("smtp_username", ""))
     smtp_password = str(settings.get("smtp_password", ""))
     signal_strictness = int(settings.get("signal_strictness", 3))
+    api_key = str(settings.get("alpha_vantage_api_key", ""))
 
     st.caption("Mobiilivaade: ainult scan nupp, portfelli seis, top signaalid ja scan'i järel soovitused.")
     st.caption(f"Analüüsi rangus: {get_strictness_label(signal_strictness)}")
@@ -944,6 +977,7 @@ def render_mobile_header(settings: Dict) -> Tuple[float, str, str, str, int, flo
         smtp_username,
         smtp_password,
         signal_strictness,
+        api_key,
     )
 
 
@@ -961,6 +995,7 @@ def save_ui_settings(
     smtp_username: str,
     smtp_password: str,
     signal_strictness: int,
+    api_key: str,
 ) -> Dict:
     parsed_universe = unique_symbols([x.strip().upper() for x in universe_text.split(",") if x.strip()])
     settings.update({
@@ -976,6 +1011,7 @@ def save_ui_settings(
         "smtp_username": smtp_username,
         "smtp_password": smtp_password,
         "signal_strictness": int(signal_strictness),
+        "alpha_vantage_api_key": api_key.strip(),
     })
     save_settings(settings)
     return settings
@@ -998,9 +1034,7 @@ def render_selftest(selftest: Dict) -> None:
     c2.metric("Töötavad sümbolid", int(selftest.get("loaded_count", 0)))
 
     if selftest.get("loaded_rows"):
-        df = pd.DataFrame(
-            [{"symbol": k, "rows": v} for k, v in selftest["loaded_rows"].items()]
-        ).sort_values("symbol")
+        df = pd.DataFrame([{"symbol": k, "rows": v} for k, v in selftest["loaded_rows"].items()]).sort_values("symbol")
         st.dataframe(df, use_container_width=True, hide_index=True)
 
     if selftest.get("failures"):
@@ -1125,6 +1159,7 @@ def run_streamlit_app() -> None:
             smtp_username,
             smtp_password,
             signal_strictness,
+            api_key,
         ) = render_desktop_sidebar(settings)
     else:
         (
@@ -1140,6 +1175,7 @@ def run_streamlit_app() -> None:
             smtp_username,
             smtp_password,
             signal_strictness,
+            api_key,
         ) = render_mobile_header(settings)
 
     render_portfolio_overview(portfolio)
@@ -1163,6 +1199,7 @@ def run_streamlit_app() -> None:
                     smtp_username,
                     smtp_password,
                     signal_strictness,
+                    api_key,
                 )
                 if not portfolio.get("positions") and not portfolio.get("closed_positions"):
                     portfolio["cash"] = float(investable_amount)
@@ -1175,7 +1212,7 @@ def run_streamlit_app() -> None:
     proposals = pd.DataFrame()
     data_keys: List[str] = []
     missing_symbols: List[str] = []
-    selftest = run_data_source_selftest()
+    selftest = run_data_source_selftest(api_key)
 
     if run_scan_now:
         try:
@@ -1193,6 +1230,7 @@ def run_streamlit_app() -> None:
                 smtp_username,
                 smtp_password,
                 signal_strictness,
+                api_key,
             )
 
             if not portfolio.get("positions") and not portfolio.get("closed_positions"):
