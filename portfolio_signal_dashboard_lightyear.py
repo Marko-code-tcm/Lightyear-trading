@@ -16,7 +16,7 @@ import streamlit as st
 import yfinance as yf
 
 
-# VERSION 2026-04-12-DIAGNOSTIC
+# VERSION 2026-04-13-YF-STABLE
 
 APP_DIR = Path(".")
 STATE_DIR = APP_DIR / "portfolio_state"
@@ -30,14 +30,39 @@ TRANSACTIONS_FILE = STATE_DIR / "transactions.csv"
 FIXED_NOTIFICATION_EMAIL = "marko.johanson@icloud.com"
 
 DEFAULT_BENCHMARK = "SPY"
-MIN_AVG_DOLLAR_VOLUME = 1_000_000  # enne 10M, nüüd leebem
+MIN_AVG_DOLLAR_VOLUME = 1_000_000
+DEFAULT_PERIOD = "6mo"
+DEFAULT_INTERVAL = "1d"
+
 DEFAULT_UNIVERSE = [
     "SPY", "QQQ", "IWM", "DIA",
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU",
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
     "AMD", "AVGO", "NFLX", "JPM", "BAC", "GS", "XOM", "CVX",
     "LLY", "UNH", "COST", "CRM", "ORCL", "ADBE",
-    "VWCE", "VUSA", "CSPX", "EUNL", "SXR8", "VUAA", "CNDX", "IUIT",
+    "ASML", "QCOM", "TXN", "AMAT", "LRCX", "KLAC", "MU", "INTU",
+    "NOW", "PANW", "CRWD", "SHOP", "PLTR", "UBER", "ABNB", "INTC",
+    "IBM", "CSCO", "ANET", "CDNS", "SNPS", "ADI", "NXPI",
+    "V", "MA", "AXP", "BLK", "MS", "WFC", "C",
+    "JNJ", "MRK", "ABBV", "PFE", "TMO", "DHR", "ISRG", "ABT",
+    "AMGN", "REGN", "VRTX", "ZTS", "HCA", "IDXX",
+    "GE", "HON", "CAT", "DE", "ETN", "PH", "TT", "EMR",
+    "RTX", "LHX", "NOC", "GD", "UNP", "CSX", "NSC", "FDX", "UPS",
+    "COP", "EOG", "SLB", "MPC", "VLO", "OXY", "LIN", "APD", "ECL",
+    "FCX", "NEM", "NUE", "STLD", "FSLR",
+    "NEE", "DUK", "SO", "AEP", "XEL",
+    "WMT", "PG", "KO", "PEP", "MCD", "CMG", "NKE", "LULU",
+    "TJX", "LOW", "HD", "TGT", "AZO", "ORLY", "BKNG",
+    "TMUS", "VZ", "T", "CMCSA", "CHTR", "DIS", "SPOT",
+    "EA", "TTWO",
+    "PLD", "AMT", "EQIX", "CCI", "PSA", "O", "WELL", "SPG", "DLR", "VICI",
+    "LEN", "DHI", "NVR",
+    "ON", "TER", "MPWR", "SWKS", "QRVO", "OLED", "GFS", "JBL", "FLEX",
+    "GLW", "KEYS", "AKAM", "CYBR",
+    "TOST", "DUOL", "AXON", "SOFI", "HOOD", "COIN", "AFRM", "UPST",
+    "BILL", "ESTC", "TSM", "SAP", "NVO", "AZN", "SHEL", "BP",
+    "RIO", "BHP", "RELX", "NGG", "HSBC", "UBS", "SAN", "ING", "DB",
+    "SNY", "NVS", "BUD", "TTE", "PBR", "VALE", "ITUB", "CRH",
 ]
 
 
@@ -115,6 +140,17 @@ def append_csv_row(path: Path, row: Dict) -> None:
     df.to_csv(path, index=False)
 
 
+def unique_symbols(symbols: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for s in symbols:
+        s2 = str(s).strip().upper()
+        if s2 and s2 not in seen:
+            seen.add(s2)
+            out.append(s2)
+    return out
+
+
 def get_thresholds(strictness: int) -> Tuple[float, float]:
     mapping = {
         1: (3.0, -2.0),
@@ -135,9 +171,16 @@ def get_strictness_label(strictness: int) -> str:
     return labels.get(strictness, "Range")
 
 
-def download_symbol_history(symbol: str, period: str = "18mo", interval: str = "1d") -> pd.DataFrame:
+def download_symbol_history(symbol: str, period: str = DEFAULT_PERIOD, interval: str = DEFAULT_INTERVAL) -> pd.DataFrame:
     try:
-        df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
+        df = yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
     except Exception:
         return pd.DataFrame()
 
@@ -155,13 +198,18 @@ def download_symbol_history(symbol: str, period: str = "18mo", interval: str = "
     out = df[[cols["open"], cols["high"], cols["low"], cols["close"], cols["volume"]]].copy()
     out.columns = ["Open", "High", "Low", "Close", "Volume"]
     out.index = pd.to_datetime(out.index)
-    return out.sort_index().dropna()
+    out = out.sort_index().dropna()
+
+    if out.empty:
+        return pd.DataFrame()
+
+    return out
 
 
 def download_universe_data(symbols: List[str]) -> Dict[str, pd.DataFrame]:
     out: Dict[str, pd.DataFrame] = {}
-    for symbol in sorted(set(symbols)):
-        df = download_symbol_history(symbol)
+    for symbol in unique_symbols(symbols):
+        df = download_symbol_history(symbol, period=DEFAULT_PERIOD, interval=DEFAULT_INTERVAL)
         if not df.empty:
             out[symbol] = df
     return out
@@ -240,6 +288,7 @@ def score_symbol(
     strictness: int,
 ) -> Dict:
     x = add_indicators(df)
+
     if len(x) < 120:
         return {"symbol": symbol, "action": "SKIP", "score": np.nan, "reason": "not enough history"}
 
@@ -375,12 +424,15 @@ def score_symbol(
     }
 
 
-def run_daily_scan(universe: List[str], benchmark: str, strictness: int) -> Tuple[str, pd.DataFrame, Dict[str, pd.DataFrame]]:
-    symbols = sorted(set(universe + [benchmark]))
+def run_daily_scan(universe: List[str], benchmark: str, strictness: int) -> Tuple[str, pd.DataFrame, Dict[str, pd.DataFrame], List[str]]:
+    universe = unique_symbols(universe)
+    symbols = unique_symbols(universe + [benchmark])
     data = download_universe_data(symbols)
 
     benchmark_df = data.get(benchmark)
     regime = compute_market_regime(benchmark_df)
+
+    missing_symbols = [s for s in universe if s not in data]
 
     rows: List[Dict] = []
     for symbol in universe:
@@ -403,7 +455,7 @@ def run_daily_scan(universe: List[str], benchmark: str, strictness: int) -> Tupl
         signals["scan_date"] = pd.Timestamp(date.today())
         signals = signals.sort_values(["action", "score"], ascending=[True, False])
 
-    return regime, signals, data
+    return regime, signals, data, missing_symbols
 
 
 def summarize_signals(signals: pd.DataFrame) -> Dict[str, int]:
@@ -691,14 +743,14 @@ def send_notifications(settings: Dict, regime: str, proposals: pd.DataFrame) -> 
 
 
 def execute_daily_job(settings: Dict, portfolio: Dict) -> Dict:
-    universe = [str(x).strip().upper() for x in settings.get("user_universe", []) if str(x).strip()]
+    universe = unique_symbols([str(x).strip().upper() for x in settings.get("user_universe", []) if str(x).strip()])
     benchmark = str(settings.get("benchmark", DEFAULT_BENCHMARK)).upper().strip()
     strictness = int(settings.get("signal_strictness", 3))
 
     if benchmark not in universe:
         universe.append(benchmark)
 
-    regime, signals, data = run_daily_scan(universe, benchmark, strictness)
+    regime, signals, data, missing_symbols = run_daily_scan(universe, benchmark, strictness)
 
     settings["last_scan_date"] = str(date.today())
     save_settings(settings)
@@ -724,6 +776,7 @@ def execute_daily_job(settings: Dict, portfolio: Dict) -> Dict:
         "notification_ok": notif_ok,
         "notification_message": notif_msg,
         "data_keys": sorted(list(data.keys())),
+        "missing_symbols": missing_symbols,
     }
 
 
@@ -874,7 +927,7 @@ def save_ui_settings(
     smtp_password: str,
     signal_strictness: int,
 ) -> Dict:
-    parsed_universe = [x.strip().upper() for x in universe_text.split(",") if x.strip()]
+    parsed_universe = unique_symbols([x.strip().upper() for x in universe_text.split(",") if x.strip()])
     settings.update({
         "investable_amount": float(investable_amount),
         "benchmark": benchmark,
@@ -929,6 +982,20 @@ def render_top_signals(signals: pd.DataFrame) -> None:
         st.write("Täna top signaale ei ole.")
         return
     st.dataframe(top_df, use_container_width=True, hide_index=True)
+
+
+def render_loaded_missing(data_keys: List[str], missing_symbols: List[str]) -> None:
+    st.subheader("Andmete diagnostika")
+    c1, c2 = st.columns(2)
+    c1.metric("Laetud tickerid", len(data_keys))
+    c2.metric("Puuduvad tickerid", len(missing_symbols))
+
+    if data_keys:
+        with st.expander("Laetud tickerid"):
+            st.write(", ".join(data_keys))
+    if missing_symbols:
+        with st.expander("Puuduvad tickerid"):
+            st.write(", ".join(missing_symbols))
 
 
 def render_proposals(proposals: pd.DataFrame, portfolio: Dict) -> None:
@@ -1055,6 +1122,8 @@ def run_streamlit_app() -> None:
     run_scan_now = st.button("Run daily scan", type="primary", use_container_width=True)
     signals = pd.DataFrame()
     proposals = pd.DataFrame()
+    data_keys: List[str] = []
+    missing_symbols: List[str] = []
 
     if run_scan_now:
         try:
@@ -1082,6 +1151,8 @@ def run_streamlit_app() -> None:
             result = execute_daily_job(settings, portfolio)
             signals = result["signals"]
             proposals = result["proposals"]
+            data_keys = result["data_keys"]
+            missing_symbols = result["missing_symbols"]
 
             if not signals.empty and signals["reason"].astype(str).str.contains("benchmark unavailable", case=False, na=False).any():
                 st.warning("Benchmark ei laadinud ära. Scan jooksis edasi NEUTRAL režiimis.")
@@ -1108,6 +1179,7 @@ def run_streamlit_app() -> None:
         render_signal_summary(signals)
         render_skip_reasons(signals)
         render_top_signals(signals)
+        render_loaded_missing(data_keys, missing_symbols)
     elif HISTORY_FILE.exists():
         try:
             hist = pd.read_csv(HISTORY_FILE)
