@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import io
 import json
 import math
 import smtplib
@@ -17,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 
-# VERSION 2026-04-13-ALPHAVANTAGE
+# VERSION 2026-04-13-STOOQ
 
 APP_DIR = Path(".")
 STATE_DIR = APP_DIR / "portfolio_state"
@@ -29,6 +30,7 @@ HISTORY_FILE = STATE_DIR / "signal_history.csv"
 TRANSACTIONS_FILE = STATE_DIR / "transactions.csv"
 
 FIXED_NOTIFICATION_EMAIL = "marko.johanson@icloud.com"
+STOOQ_BASE_URL = "https://stooq.com/q/d/l/"
 
 DEFAULT_BENCHMARK = "SPY"
 MIN_AVG_DOLLAR_VOLUME = 500_000.0
@@ -81,7 +83,6 @@ def default_settings() -> Dict:
         "smtp_username": "",
         "smtp_password": "",
         "signal_strictness": 3,
-        "alpha_vantage_api_key": "",
     }
 
 
@@ -152,99 +153,77 @@ def unique_symbols(symbols: List[str]) -> List[str]:
     return out
 
 
-def get_thresholds(strictness: int) -> Tuple[float, float]:
-    mapping = {
-        1: (2.5, -2.0),
-        2: (3.5, -3.0),
-        3: (4.5, -4.0),
-        4: (5.5, -5.0),
-    }
-    return mapping.get(strictness, (4.5, -4.0))
+def stooq_symbol(symbol: str) -> str:
+    s = str(symbol).strip().lower()
+    if not s:
+        return s
+    if "." in s or "^" in s:
+        return s
+    return f"{s}.us"
 
 
-def get_strictness_label(strictness: int) -> str:
-    labels = {
-        1: "Leebe",
-        2: "Tavaline",
-        3: "Range",
-        4: "Väga range",
-    }
-    return labels.get(strictness, "Range")
+def stooq_csv_url(symbol: str) -> str:
+    params = {"s": stooq_symbol(symbol), "i": "d"}
+    return STOOQ_BASE_URL + "?" + urllib.parse.urlencode(params)
 
 
-def alpha_vantage_url(symbol: str, api_key: str) -> str:
-    params = {
-        "function": "TIME_SERIES_DAILY",
-        "symbol": symbol,
-        "outputsize": "compact",
-        "datatype": "json",
-        "apikey": api_key,
-    }
-    return "https://www.alphavantage.co/query?" + urllib.parse.urlencode(params)
-
-
-def download_symbol_history(symbol: str, api_key: str, timeout: int = 20) -> pd.DataFrame:
-    if not api_key.strip():
-        return pd.DataFrame()
-
-    url = alpha_vantage_url(symbol, api_key)
+def download_symbol_history(symbol: str, timeout: int = 20) -> pd.DataFrame:
+    url = stooq_csv_url(symbol)
     req = urllib.request.Request(
         url,
         headers={
             "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json",
+            "Accept": "text/csv,text/plain,*/*",
         },
     )
 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-        payload = json.loads(raw)
+            raw = resp.read().decode("utf-8", errors="ignore")
     except Exception:
         return pd.DataFrame()
 
-    series = payload.get("Time Series (Daily)")
-    if not isinstance(series, dict) or not series:
+    if not raw.strip():
+        return pd.DataFrame()
+    if "No data" in raw or "Brak danych" in raw:
         return pd.DataFrame()
 
-    rows = []
-    for dt, values in series.items():
-        try:
-            rows.append(
-                {
-                    "Date": pd.to_datetime(dt),
-                    "Open": float(values["1. open"]),
-                    "High": float(values["2. high"]),
-                    "Low": float(values["3. low"]),
-                    "Close": float(values["4. close"]),
-                    "Volume": float(values["5. volume"]),
-                }
-            )
-        except Exception:
-            continue
-
-    if not rows:
+    try:
+        df = pd.read_csv(io.StringIO(raw))
+    except Exception:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows).set_index("Date").sort_index()
-    return df.dropna()
+    needed = {"Date", "Open", "High", "Low", "Close", "Volume"}
+    if not needed.issubset(set(df.columns)):
+        return pd.DataFrame()
+
+    try:
+        df["Date"] = pd.to_datetime(df["Date"])
+        for c in ["Open", "High", "Low", "Close", "Volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["Date", "Open", "High", "Low", "Close", "Volume"])
+        df = df.set_index("Date").sort_index()
+    except Exception:
+        return pd.DataFrame()
+
+    return df
 
 
-def download_universe_data(symbols: List[str], api_key: str) -> Dict[str, pd.DataFrame]:
+def download_universe_data(symbols: List[str]) -> Dict[str, pd.DataFrame]:
     out: Dict[str, pd.DataFrame] = {}
     for symbol in unique_symbols(symbols):
-        df = download_symbol_history(symbol, api_key=api_key)
+        df = download_symbol_history(symbol)
         if not df.empty:
             out[symbol] = df
     return out
 
 
-def run_data_source_selftest(api_key: str) -> Dict:
+def run_data_source_selftest() -> Dict:
     loaded = {}
     failures = []
 
     for symbol in SELFTEST_SYMBOLS:
-        df = download_symbol_history(symbol, api_key=api_key)
+        df = download_symbol_history(symbol)
         if df.empty:
             failures.append(symbol)
         else:
@@ -257,6 +236,25 @@ def run_data_source_selftest(api_key: str) -> Dict:
         "failures": failures,
         "ok": len(loaded) > 0,
     }
+
+
+def get_thresholds(strictness: int) -> Tuple[float, float]:
+    mapping = {
+        1: (2.5, -2.0),
+        2: (3.5, -3.0),
+        3: (4.5, -4.0),
+        4: (5.5, -5.0),
+    }
+    return mapping.get(strictness, (4.5, -4.0))
+
+
+def get_strictness_label(strictness: int) -> str:
+    return {
+        1: "Leebe",
+        2: "Tavaline",
+        3: "Range",
+        4: "Väga range",
+    }.get(strictness, "Range")
 
 
 def compute_atr(df: pd.DataFrame, lookback: int = 14) -> pd.Series:
@@ -323,13 +321,7 @@ def relative_strength_score(symbol_df: pd.DataFrame, benchmark_df: Optional[pd.D
     return float(rs.iloc[-1] / rs.iloc[-lookback] - 1.0)
 
 
-def score_symbol(
-    symbol: str,
-    df: pd.DataFrame,
-    benchmark_df: Optional[pd.DataFrame],
-    regime: str,
-    strictness: int,
-) -> Dict:
+def score_symbol(symbol: str, df: pd.DataFrame, benchmark_df: Optional[pd.DataFrame], regime: str, strictness: int) -> Dict:
     x = add_indicators(df)
 
     if len(x) < 70:
@@ -462,15 +454,10 @@ def score_symbol(
     }
 
 
-def run_daily_scan(
-    universe: List[str],
-    benchmark: str,
-    strictness: int,
-    api_key: str,
-) -> Tuple[str, pd.DataFrame, Dict[str, pd.DataFrame], List[str]]:
+def run_daily_scan(universe: List[str], benchmark: str, strictness: int) -> Tuple[str, pd.DataFrame, Dict[str, pd.DataFrame], List[str]]:
     universe = unique_symbols(universe)
     symbols = unique_symbols(universe + [benchmark])
-    data = download_universe_data(symbols, api_key=api_key)
+    data = download_universe_data(symbols)
 
     benchmark_df = data.get(benchmark)
     regime = compute_market_regime(benchmark_df)
@@ -487,8 +474,7 @@ def run_daily_scan(
         try:
             result = score_symbol(symbol, df, benchmark_df, regime, strictness)
             if benchmark_df is None:
-                extra = f"benchmark unavailable: {benchmark}"
-                result["reason"] = f"{result.get('reason', '')}; {extra}".strip("; ")
+                result["reason"] = f"{result.get('reason', '')}; benchmark unavailable: {benchmark}".strip("; ")
             rows.append(result)
         except Exception as exc:
             rows.append({"symbol": symbol, "action": "SKIP", "score": np.nan, "reason": f"error: {exc}"})
@@ -505,38 +491,27 @@ def summarize_signals(signals: pd.DataFrame) -> Dict[str, int]:
     if signals.empty or "action" not in signals.columns:
         return {"BUY": 0, "HOLD": 0, "SELL": 0, "SKIP": 0}
     counts = signals["action"].value_counts().to_dict()
-    return {
-        "BUY": int(counts.get("BUY", 0)),
-        "HOLD": int(counts.get("HOLD", 0)),
-        "SELL": int(counts.get("SELL", 0)),
-        "SKIP": int(counts.get("SKIP", 0)),
-    }
+    return {k: int(counts.get(k, 0)) for k in ["BUY", "HOLD", "SELL", "SKIP"]}
 
 
 def summarize_skip_reasons(signals: pd.DataFrame) -> pd.DataFrame:
     if signals.empty or "action" not in signals.columns or "reason" not in signals.columns:
         return pd.DataFrame()
-
     skip_df = signals[signals["action"] == "SKIP"].copy()
     if skip_df.empty:
         return pd.DataFrame()
-
-    reasons = skip_df["reason"].fillna("unknown").astype(str).str.strip()
-    counts = Counter(reasons)
-    out = pd.DataFrame({"reason": list(counts.keys()), "count": list(counts.values())})
-    return out.sort_values("count", ascending=False).reset_index(drop=True)
+    counts = Counter(skip_df["reason"].fillna("unknown").astype(str).str.strip())
+    return pd.DataFrame({"reason": list(counts.keys()), "count": list(counts.values())}).sort_values("count", ascending=False)
 
 
 def top_signals_df(signals: pd.DataFrame, n: int = 10) -> pd.DataFrame:
     if signals.empty:
         return pd.DataFrame()
-    df = signals.copy()
-    df = df[df["action"] != "SKIP"].copy() if "action" in df.columns else df
+    df = signals[signals["action"] != "SKIP"].copy()
     if df.empty:
         return pd.DataFrame()
-    df = df.sort_values("score", ascending=False).head(n)
     cols = ["symbol", "action", "score", "confidence", "conviction", "signal_price", "close", "reason"]
-    return df[[c for c in cols if c in df.columns]].copy()
+    return df.sort_values("score", ascending=False).head(n)[cols]
 
 
 def normalize_positions(portfolio: Dict) -> None:
@@ -554,16 +529,12 @@ def normalize_positions(portfolio: Dict) -> None:
 
 
 def estimate_portfolio_value(portfolio: Dict) -> float:
-    total = float(portfolio.get("cash", 0.0))
-    for pos in portfolio.get("positions", {}).values():
-        total += float(pos.get("market_value", 0.0))
-    return total
+    return float(portfolio.get("cash", 0.0)) + sum(float(p.get("market_value", 0.0)) for p in portfolio.get("positions", {}).values())
 
 
 def update_position_marks(portfolio: Dict, signals: pd.DataFrame) -> None:
     normalize_positions(portfolio)
     signal_map = {row["symbol"]: row for _, row in signals.iterrows()}
-
     for symbol, pos in portfolio["positions"].items():
         row = signal_map.get(symbol)
         if row is None:
@@ -594,14 +565,12 @@ def determine_buy_budget(portfolio: Dict, settings: Dict, num_candidates: int) -
     free_cash = available_cash_for_new_positions(portfolio, settings)
     if free_cash <= 0:
         return 0.0
-
     slots = max(1, min(num_candidates, int(settings.get("max_new_positions_per_day", 3))))
     if settings.get("position_mode", "Equal weight") == "Equal weight":
         current_positions = len(portfolio.get("positions", {}))
         target_positions = max(current_positions + slots, 1)
         target_size = estimate_portfolio_value(portfolio) / target_positions
         return max(0.0, min(free_cash / slots, target_size))
-
     return free_cash / slots
 
 
@@ -612,8 +581,7 @@ def build_actionable_proposals(portfolio: Dict, settings: Dict, signals: pd.Data
     open_symbols = current_open_symbols(portfolio)
     rows = []
 
-    buys = signals[(signals["action"] == "BUY") & (~signals["symbol"].isin(open_symbols))].copy()
-    buys = buys.sort_values("score", ascending=False)
+    buys = signals[(signals["action"] == "BUY") & (~signals["symbol"].isin(open_symbols))].copy().sort_values("score", ascending=False)
     budget_per_buy = determine_buy_budget(portfolio, settings, len(buys))
 
     for _, row in buys.iterrows():
@@ -622,13 +590,7 @@ def build_actionable_proposals(portfolio: Dict, settings: Dict, signals: pd.Data
         est_cost = round(qty * price, 2)
         if qty <= 0:
             continue
-        rows.append({
-            **row.to_dict(),
-            "proposal_type": "BUY",
-            "quantity": qty,
-            "estimated_cash_impact": -est_cost,
-            "note": "Open new position",
-        })
+        rows.append({**row.to_dict(), "proposal_type": "BUY", "quantity": qty, "estimated_cash_impact": -est_cost, "note": "Open new position"})
 
     for _, row in signals.iterrows():
         symbol = str(row["symbol"])
@@ -678,18 +640,15 @@ def accept_buy(portfolio: Dict, symbol: str, quantity: int, price: float, reason
         "last_signal_score": None if score is None or pd.isna(score) else float(score),
         "last_signal_reason": reason,
     }
-    append_csv_row(
-        TRANSACTIONS_FILE,
-        {
-            "timestamp": datetime.now().isoformat(),
-            "type": "BUY",
-            "symbol": symbol,
-            "quantity": quantity,
-            "price": round(price, 4),
-            "gross_amount": cost,
-            "reason": reason,
-        },
-    )
+    append_csv_row(TRANSACTIONS_FILE, {
+        "timestamp": datetime.now().isoformat(),
+        "type": "BUY",
+        "symbol": symbol,
+        "quantity": quantity,
+        "price": round(price, 4),
+        "gross_amount": cost,
+        "reason": reason,
+    })
     save_portfolio(portfolio)
     return f"Ost aktsepteeritud: {symbol}, {quantity} tk hinnaga {price:.2f}."
 
@@ -717,19 +676,16 @@ def accept_sell(portfolio: Dict, symbol: str, price: float, reason: str, score: 
     })
     del portfolio["positions"][symbol]
 
-    append_csv_row(
-        TRANSACTIONS_FILE,
-        {
-            "timestamp": datetime.now().isoformat(),
-            "type": "SELL",
-            "symbol": symbol,
-            "quantity": qty,
-            "price": round(price, 4),
-            "gross_amount": proceeds,
-            "reason": reason,
-            "realized_pnl": pnl,
-        },
-    )
+    append_csv_row(TRANSACTIONS_FILE, {
+        "timestamp": datetime.now().isoformat(),
+        "type": "SELL",
+        "symbol": symbol,
+        "quantity": qty,
+        "price": round(price, 4),
+        "gross_amount": proceeds,
+        "reason": reason,
+        "realized_pnl": pnl,
+    })
     save_portfolio(portfolio)
     return f"Müük aktsepteeritud: {symbol}, {qty} tk hinnaga {price:.2f}, P/L {pnl:.2f}."
 
@@ -774,20 +730,18 @@ def build_notification_message(regime: str, proposals: pd.DataFrame, settings: D
 def send_notifications(settings: Dict, regime: str, proposals: pd.DataFrame) -> Tuple[bool, str]:
     if not settings.get("notifications_enabled", False):
         return False, "Notifications are disabled"
-    text = build_notification_message(regime, proposals, settings)
     return send_email_message(
         settings.get("smtp_host", "smtp.gmail.com"),
         int(settings.get("smtp_port", 587)),
         settings.get("smtp_username", ""),
         settings.get("smtp_password", ""),
         FIXED_NOTIFICATION_EMAIL,
-        text,
+        build_notification_message(regime, proposals, settings),
     )
 
 
 def execute_daily_job(settings: Dict, portfolio: Dict) -> Dict:
-    api_key = str(settings.get("alpha_vantage_api_key", "")).strip()
-    selftest = run_data_source_selftest(api_key)
+    selftest = run_data_source_selftest()
     if not selftest["ok"]:
         return {
             "regime": "UNKNOWN",
@@ -807,12 +761,7 @@ def execute_daily_job(settings: Dict, portfolio: Dict) -> Dict:
     if benchmark not in universe:
         universe.append(benchmark)
 
-    regime, signals, data, missing_symbols = run_daily_scan(
-        universe=universe,
-        benchmark=benchmark,
-        strictness=strictness,
-        api_key=api_key,
-    )
+    regime, signals, data, missing_symbols = run_daily_scan(universe, benchmark, strictness)
 
     settings["last_scan_date"] = str(date.today())
     save_settings(settings)
@@ -905,23 +854,17 @@ def render_top_bar() -> None:
             st.rerun()
 
 
-def render_desktop_sidebar(settings: Dict) -> Tuple[float, str, str, str, int, float, bool, str, int, str, str, int, str]:
+def render_desktop_sidebar(settings: Dict):
     with st.sidebar:
         st.header("Seaded")
-
         investable_amount = st.number_input("Investeeritav summa", min_value=0.0, value=float(settings.get("investable_amount", 10000.0)), step=100.0)
         benchmark = st.text_input("Benchmark", value=str(settings.get("benchmark", DEFAULT_BENCHMARK))).upper().strip()
         universe_text = st.text_area("Jälgitavad tickerid (komaga eraldatud)", value=", ".join(settings.get("user_universe", DEFAULT_UNIVERSE)), height=140)
         position_mode = st.selectbox("Uute ostude jaotus", options=["Equal weight", "Use available cash evenly"], index=0 if settings.get("position_mode", "Equal weight") == "Equal weight" else 1)
         max_new_positions_per_day = st.number_input("Maksimaalne uute positsioonide arv päevas", min_value=1, max_value=20, value=int(settings.get("max_new_positions_per_day", 3)), step=1)
         min_cash_buffer_pct = st.slider("Raha puhver osakaaluna portfellist", min_value=0.0, max_value=0.30, value=float(settings.get("min_cash_buffer_pct", 0.05)), step=0.01)
-
         signal_strictness = st.slider("Analüüsi rangus", min_value=1, max_value=4, value=int(settings.get("signal_strictness", 3)), step=1)
         st.caption(f"{get_strictness_label(signal_strictness)} — leebe annab rohkem signaale, range vähem aga tugevamaid.")
-
-        st.subheader("Andmeallikas")
-        api_key = st.text_input("Alpha Vantage API key", value=str(settings.get("alpha_vantage_api_key", "")), type="password")
-
         st.subheader("E-maili teavitus")
         notifications_enabled = st.checkbox("Teavitused lubatud", value=bool(settings.get("notifications_enabled", False)))
         st.caption(f"Teavitused lähevad aadressile: {FIXED_NOTIFICATION_EMAIL}")
@@ -929,79 +872,39 @@ def render_desktop_sidebar(settings: Dict) -> Tuple[float, str, str, str, int, f
         smtp_port = st.number_input("SMTP port", min_value=1, max_value=65535, value=int(settings.get("smtp_port", 587)), step=1)
         smtp_username = st.text_input("SMTP username", value=str(settings.get("smtp_username", "")))
         smtp_password = st.text_input("SMTP password", value=str(settings.get("smtp_password", "")), type="password")
-
     return (
-        investable_amount,
-        benchmark,
-        universe_text,
-        position_mode,
-        int(max_new_positions_per_day),
-        float(min_cash_buffer_pct),
-        bool(notifications_enabled),
-        smtp_host,
-        int(smtp_port),
-        smtp_username,
-        smtp_password,
-        int(signal_strictness),
-        api_key,
+        investable_amount, benchmark, universe_text, position_mode, int(max_new_positions_per_day),
+        float(min_cash_buffer_pct), bool(notifications_enabled), smtp_host, int(smtp_port),
+        smtp_username, smtp_password, int(signal_strictness)
     )
 
 
-def render_mobile_header(settings: Dict) -> Tuple[float, str, str, str, int, float, bool, str, int, str, str, int, str]:
-    investable_amount = float(settings.get("investable_amount", 10000.0))
-    benchmark = str(settings.get("benchmark", DEFAULT_BENCHMARK)).upper().strip()
-    universe_text = ", ".join(settings.get("user_universe", DEFAULT_UNIVERSE))
-    position_mode = settings.get("position_mode", "Equal weight")
-    max_new_positions_per_day = int(settings.get("max_new_positions_per_day", 3))
-    min_cash_buffer_pct = float(settings.get("min_cash_buffer_pct", 0.05))
-    notifications_enabled = bool(settings.get("notifications_enabled", False))
-    smtp_host = str(settings.get("smtp_host", "smtp.gmail.com"))
-    smtp_port = int(settings.get("smtp_port", 587))
-    smtp_username = str(settings.get("smtp_username", ""))
-    smtp_password = str(settings.get("smtp_password", ""))
-    signal_strictness = int(settings.get("signal_strictness", 3))
-    api_key = str(settings.get("alpha_vantage_api_key", ""))
-
+def render_mobile_header(settings: Dict):
     st.caption("Mobiilivaade: ainult scan nupp, portfelli seis, top signaalid ja scan'i järel soovitused.")
-    st.caption(f"Analüüsi rangus: {get_strictness_label(signal_strictness)}")
+    st.caption(f"Analüüsi rangus: {get_strictness_label(int(settings.get('signal_strictness', 3)))}")
     return (
-        investable_amount,
-        benchmark,
-        universe_text,
-        position_mode,
-        max_new_positions_per_day,
-        min_cash_buffer_pct,
-        notifications_enabled,
-        smtp_host,
-        smtp_port,
-        smtp_username,
-        smtp_password,
-        signal_strictness,
-        api_key,
+        float(settings.get("investable_amount", 10000.0)),
+        str(settings.get("benchmark", DEFAULT_BENCHMARK)).upper().strip(),
+        ", ".join(settings.get("user_universe", DEFAULT_UNIVERSE)),
+        settings.get("position_mode", "Equal weight"),
+        int(settings.get("max_new_positions_per_day", 3)),
+        float(settings.get("min_cash_buffer_pct", 0.05)),
+        bool(settings.get("notifications_enabled", False)),
+        str(settings.get("smtp_host", "smtp.gmail.com")),
+        int(settings.get("smtp_port", 587)),
+        str(settings.get("smtp_username", "")),
+        str(settings.get("smtp_password", "")),
+        int(settings.get("signal_strictness", 3)),
     )
 
 
-def save_ui_settings(
-    settings: Dict,
-    investable_amount: float,
-    benchmark: str,
-    universe_text: str,
-    position_mode: str,
-    max_new_positions_per_day: int,
-    min_cash_buffer_pct: float,
-    notifications_enabled: bool,
-    smtp_host: str,
-    smtp_port: int,
-    smtp_username: str,
-    smtp_password: str,
-    signal_strictness: int,
-    api_key: str,
-) -> Dict:
-    parsed_universe = unique_symbols([x.strip().upper() for x in universe_text.split(",") if x.strip()])
+def save_ui_settings(settings: Dict, investable_amount: float, benchmark: str, universe_text: str, position_mode: str,
+                     max_new_positions_per_day: int, min_cash_buffer_pct: float, notifications_enabled: bool,
+                     smtp_host: str, smtp_port: int, smtp_username: str, smtp_password: str, signal_strictness: int) -> Dict:
     settings.update({
         "investable_amount": float(investable_amount),
         "benchmark": benchmark,
-        "user_universe": parsed_universe,
+        "user_universe": unique_symbols([x.strip().upper() for x in universe_text.split(",") if x.strip()]),
         "position_mode": position_mode,
         "max_new_positions_per_day": int(max_new_positions_per_day),
         "min_cash_buffer_pct": float(min_cash_buffer_pct),
@@ -1011,7 +914,6 @@ def save_ui_settings(
         "smtp_username": smtp_username,
         "smtp_password": smtp_password,
         "signal_strictness": int(signal_strictness),
-        "alpha_vantage_api_key": api_key.strip(),
     })
     save_settings(settings)
     return settings
@@ -1032,11 +934,9 @@ def render_selftest(selftest: Dict) -> None:
     c1, c2 = st.columns(2)
     c1.metric("Testitud sümbolid", len(selftest.get("tested", [])))
     c2.metric("Töötavad sümbolid", int(selftest.get("loaded_count", 0)))
-
     if selftest.get("loaded_rows"):
         df = pd.DataFrame([{"symbol": k, "rows": v} for k, v in selftest["loaded_rows"].items()]).sort_values("symbol")
         st.dataframe(df, use_container_width=True, hide_index=True)
-
     if selftest.get("failures"):
         st.warning("Need test-sümbolid ei tulnud sisse: " + ", ".join(selftest["failures"]))
 
@@ -1053,20 +953,20 @@ def render_signal_summary(signals: pd.DataFrame) -> None:
 
 def render_skip_reasons(signals: pd.DataFrame) -> None:
     st.subheader("SKIP põhjused")
-    skip_df = summarize_skip_reasons(signals)
-    if skip_df.empty:
+    df = summarize_skip_reasons(signals)
+    if df.empty:
         st.write("SKIP põhjuseid ei ole.")
-        return
-    st.dataframe(skip_df.head(10), use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(df.head(10), use_container_width=True, hide_index=True)
 
 
 def render_top_signals(signals: pd.DataFrame) -> None:
     st.subheader("Top 10 signaalid täna")
-    top_df = top_signals_df(signals, 10)
-    if top_df.empty:
+    df = top_signals_df(signals, 10)
+    if df.empty:
         st.write("Täna top signaale ei ole.")
-        return
-    st.dataframe(top_df, use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 def render_loaded_missing(data_keys: List[str], missing_symbols: List[str]) -> None:
@@ -1074,7 +974,6 @@ def render_loaded_missing(data_keys: List[str], missing_symbols: List[str]) -> N
     c1, c2 = st.columns(2)
     c1.metric("Laetud tickerid", len(data_keys))
     c2.metric("Puuduvad tickerid", len(missing_symbols))
-
     if data_keys:
         with st.expander("Laetud tickerid"):
             st.write(", ".join(data_keys))
@@ -1085,7 +984,6 @@ def render_loaded_missing(data_keys: List[str], missing_symbols: List[str]) -> N
 
 def render_proposals(proposals: pd.DataFrame, portfolio: Dict) -> None:
     st.subheader("Soovitused")
-
     if proposals.empty:
         st.write("Täna ettepanekuid veel ei ole.")
         return
@@ -1095,45 +993,38 @@ def render_proposals(proposals: pd.DataFrame, portfolio: Dict) -> None:
     buy_df = proposals[proposals["proposal_type"] == "BUY"].sort_values("score", ascending=False)
     sell_df = proposals[proposals["proposal_type"] == "SELL"].sort_values("score", ascending=True)
 
-    if not buy_df.empty:
-        st.markdown("**BUY**")
-        for _, row in buy_df.iterrows():
-            sym = str(row["symbol"])
-            with st.container(border=True):
-                st.write(f"{sym} | score {row['score']} | signal price {row.get('signal_price', row['close'])} | hind {row['close']}")
-                st.write(f"Kogus: {int(row['quantity'])} | Kulu: {fmt_money(abs(float(row['estimated_cash_impact'])))}")
-                st.write(f"Põhjus: {row['reason']}")
-                if st.button(f"Aksepteeri BUY {sym}", key=f"buy_{sym}", use_container_width=True):
-                    msg = accept_buy(
-                        portfolio,
-                        sym,
-                        int(row["quantity"]),
-                        float(row["close"]),
+    for _, row in buy_df.iterrows():
+        sym = str(row["symbol"])
+        with st.container(border=True):
+            st.write(f"{sym} | score {row['score']} | signal price {row.get('signal_price', row['close'])} | hind {row['close']}")
+            st.write(f"Kogus: {int(row['quantity'])} | Kulu: {fmt_money(abs(float(row['estimated_cash_impact'])))}")
+            st.write(f"Põhjus: {row['reason']}")
+            if st.button(f"Aksepteeri BUY {sym}", key=f"buy_{sym}", use_container_width=True):
+                st.success(
+                    accept_buy(
+                        portfolio, sym, int(row["quantity"]), float(row["close"]),
                         str(row.get("reason", "")),
                         None if pd.isna(row.get("score")) else float(row.get("score")),
                         None if pd.isna(row.get("stop_reference")) else float(row.get("stop_reference")),
                     )
-                    st.success(msg)
-                    st.rerun()
+                )
+                st.rerun()
 
-    if not sell_df.empty:
-        st.markdown("**SELL**")
-        for _, row in sell_df.iterrows():
-            sym = str(row["symbol"])
-            with st.container(border=True):
-                st.write(f"{sym} | score {row['score']} | signal price {row.get('signal_price', row['close'])} | hind {row['close']}")
-                st.write(f"Kogus: {int(row['quantity'])} | Laekumine: {fmt_money(float(row['estimated_cash_impact']))}")
-                st.write(f"Põhjus: {row['reason']}")
-                if st.button(f"Aksepteeri SELL {sym}", key=f"sell_{sym}", use_container_width=True):
-                    msg = accept_sell(
-                        portfolio,
-                        sym,
-                        float(row["close"]),
+    for _, row in sell_df.iterrows():
+        sym = str(row["symbol"])
+        with st.container(border=True):
+            st.write(f"{sym} | score {row['score']} | signal price {row.get('signal_price', row['close'])} | hind {row['close']}")
+            st.write(f"Kogus: {int(row['quantity'])} | Laekumine: {fmt_money(float(row['estimated_cash_impact']))}")
+            st.write(f"Põhjus: {row['reason']}")
+            if st.button(f"Aksepteeri SELL {sym}", key=f"sell_{sym}", use_container_width=True):
+                st.success(
+                    accept_sell(
+                        portfolio, sym, float(row["close"]),
                         str(row.get("reason", "")),
                         None if pd.isna(row.get("score")) else float(row.get("score")),
                     )
-                    st.success(msg)
-                    st.rerun()
+                )
+                st.rerun()
 
 
 def run_streamlit_app() -> None:
@@ -1146,91 +1037,45 @@ def run_streamlit_app() -> None:
     normalize_positions(portfolio)
 
     if st.session_state["view_mode"] == "desktop":
-        (
-            investable_amount,
-            benchmark,
-            universe_text,
-            position_mode,
-            max_new_positions_per_day,
-            min_cash_buffer_pct,
-            notifications_enabled,
-            smtp_host,
-            smtp_port,
-            smtp_username,
-            smtp_password,
-            signal_strictness,
-            api_key,
-        ) = render_desktop_sidebar(settings)
+        ui = render_desktop_sidebar(settings)
     else:
-        (
-            investable_amount,
-            benchmark,
-            universe_text,
-            position_mode,
-            max_new_positions_per_day,
-            min_cash_buffer_pct,
-            notifications_enabled,
-            smtp_host,
-            smtp_port,
-            smtp_username,
-            smtp_password,
-            signal_strictness,
-            api_key,
-        ) = render_mobile_header(settings)
+        ui = render_mobile_header(settings)
+
+    (
+        investable_amount, benchmark, universe_text, position_mode, max_new_positions_per_day,
+        min_cash_buffer_pct, notifications_enabled, smtp_host, smtp_port,
+        smtp_username, smtp_password, signal_strictness
+    ) = ui
 
     render_portfolio_overview(portfolio)
     st.write("")
 
     if st.session_state["view_mode"] == "desktop":
-        left, _ = st.columns([1, 1])
-        with left:
-            if st.button("Salvesta seaded", use_container_width=True):
-                save_ui_settings(
-                    settings,
-                    investable_amount,
-                    benchmark,
-                    universe_text,
-                    position_mode,
-                    max_new_positions_per_day,
-                    min_cash_buffer_pct,
-                    notifications_enabled,
-                    smtp_host,
-                    smtp_port,
-                    smtp_username,
-                    smtp_password,
-                    signal_strictness,
-                    api_key,
-                )
-                if not portfolio.get("positions") and not portfolio.get("closed_positions"):
-                    portfolio["cash"] = float(investable_amount)
-                    portfolio["initial_capital"] = float(investable_amount)
-                    save_portfolio(portfolio)
-                st.success("Seaded salvestatud.")
+        if st.button("Salvesta seaded", use_container_width=True):
+            settings = save_ui_settings(
+                settings, investable_amount, benchmark, universe_text, position_mode,
+                max_new_positions_per_day, min_cash_buffer_pct, notifications_enabled,
+                smtp_host, smtp_port, smtp_username, smtp_password, signal_strictness
+            )
+            if not portfolio.get("positions") and not portfolio.get("closed_positions"):
+                portfolio["cash"] = float(investable_amount)
+                portfolio["initial_capital"] = float(investable_amount)
+                save_portfolio(portfolio)
+            st.success("Seaded salvestatud.")
 
     run_scan_now = st.button("Run daily scan", type="primary", use_container_width=True)
     signals = pd.DataFrame()
     proposals = pd.DataFrame()
     data_keys: List[str] = []
     missing_symbols: List[str] = []
-    selftest = run_data_source_selftest(api_key)
+    selftest = run_data_source_selftest()
 
     if run_scan_now:
         try:
             settings = save_ui_settings(
-                settings,
-                investable_amount,
-                benchmark,
-                universe_text,
-                position_mode,
-                max_new_positions_per_day,
-                min_cash_buffer_pct,
-                notifications_enabled,
-                smtp_host,
-                smtp_port,
-                smtp_username,
-                smtp_password,
-                signal_strictness,
-                api_key,
+                settings, investable_amount, benchmark, universe_text, position_mode,
+                max_new_positions_per_day, min_cash_buffer_pct, notifications_enabled,
+                smtp_host, smtp_port, smtp_username, smtp_password, signal_strictness
             )
 
             if not portfolio.get("positions") and not portfolio.get("closed_positions"):
@@ -1248,9 +1093,6 @@ def run_streamlit_app() -> None:
             if not selftest["ok"]:
                 st.error("Andmeallika enesetest kukkus läbi. Scan peatati.")
             else:
-                if not signals.empty and signals["reason"].astype(str).str.contains("benchmark unavailable", case=False, na=False).any():
-                    st.warning("Benchmark ei laadinud ära. Scan jooksis edasi NEUTRAL režiimis.")
-
                 st.success(
                     f"Skänn tehtud. Turu režiim: {result['regime']}. "
                     f"Rangus: {get_strictness_label(signal_strictness)}. "
