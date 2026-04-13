@@ -16,7 +16,7 @@ import streamlit as st
 import yfinance as yf
 
 
-# VERSION 2026-04-13-YF-STABLE
+# VERSION 2026-04-13-DATASOURCE-SELFTEST
 
 APP_DIR = Path(".")
 STATE_DIR = APP_DIR / "portfolio_state"
@@ -33,6 +33,7 @@ DEFAULT_BENCHMARK = "SPY"
 MIN_AVG_DOLLAR_VOLUME = 1_000_000
 DEFAULT_PERIOD = "6mo"
 DEFAULT_INTERVAL = "1d"
+SELFTEST_SYMBOLS = ["SPY", "AAPL", "MSFT"]
 
 DEFAULT_UNIVERSE = [
     "SPY", "QQQ", "IWM", "DIA",
@@ -213,6 +214,26 @@ def download_universe_data(symbols: List[str]) -> Dict[str, pd.DataFrame]:
         if not df.empty:
             out[symbol] = df
     return out
+
+
+def run_data_source_selftest() -> Dict:
+    loaded = {}
+    failures = []
+
+    for symbol in SELFTEST_SYMBOLS:
+        df = download_symbol_history(symbol, period="3mo", interval="1d")
+        if df.empty:
+            failures.append(symbol)
+        else:
+            loaded[symbol] = len(df)
+
+    return {
+        "tested": SELFTEST_SYMBOLS,
+        "loaded_count": len(loaded),
+        "loaded_rows": loaded,
+        "failures": failures,
+        "ok": len(loaded) > 0,
+    }
 
 
 def compute_atr(df: pd.DataFrame, lookback: int = 14) -> pd.Series:
@@ -743,6 +764,19 @@ def send_notifications(settings: Dict, regime: str, proposals: pd.DataFrame) -> 
 
 
 def execute_daily_job(settings: Dict, portfolio: Dict) -> Dict:
+    selftest = run_data_source_selftest()
+    if not selftest["ok"]:
+        return {
+            "regime": "UNKNOWN",
+            "signals": pd.DataFrame(),
+            "proposals": pd.DataFrame(),
+            "notification_ok": False,
+            "notification_message": "Data source self-test failed",
+            "data_keys": [],
+            "missing_symbols": [],
+            "selftest": selftest,
+        }
+
     universe = unique_symbols([str(x).strip().upper() for x in settings.get("user_universe", []) if str(x).strip()])
     benchmark = str(settings.get("benchmark", DEFAULT_BENCHMARK)).upper().strip()
     strictness = int(settings.get("signal_strictness", 3))
@@ -777,6 +811,7 @@ def execute_daily_job(settings: Dict, portfolio: Dict) -> Dict:
         "notification_message": notif_msg,
         "data_keys": sorted(list(data.keys())),
         "missing_symbols": missing_symbols,
+        "selftest": selftest,
     }
 
 
@@ -956,6 +991,22 @@ def render_portfolio_overview(portfolio: Dict) -> None:
     c4.metric("Avatud positsioone", str(len(portfolio.get("positions", {}))))
 
 
+def render_selftest(selftest: Dict) -> None:
+    st.subheader("Andmeallika enesetest")
+    c1, c2 = st.columns(2)
+    c1.metric("Testitud sümbolid", len(selftest.get("tested", [])))
+    c2.metric("Töötavad sümbolid", int(selftest.get("loaded_count", 0)))
+
+    if selftest.get("loaded_rows"):
+        df = pd.DataFrame(
+            [{"symbol": k, "rows": v} for k, v in selftest["loaded_rows"].items()]
+        ).sort_values("symbol")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    if selftest.get("failures"):
+        st.warning("Need test-sümbolid ei tulnud sisse: " + ", ".join(selftest["failures"]))
+
+
 def render_signal_summary(signals: pd.DataFrame) -> None:
     st.subheader("Signaalide kokkuvõte")
     counts = summarize_signals(signals)
@@ -1124,6 +1175,7 @@ def run_streamlit_app() -> None:
     proposals = pd.DataFrame()
     data_keys: List[str] = []
     missing_symbols: List[str] = []
+    selftest = run_data_source_selftest()
 
     if run_scan_now:
         try:
@@ -1153,17 +1205,23 @@ def run_streamlit_app() -> None:
             proposals = result["proposals"]
             data_keys = result["data_keys"]
             missing_symbols = result["missing_symbols"]
+            selftest = result["selftest"]
 
-            if not signals.empty and signals["reason"].astype(str).str.contains("benchmark unavailable", case=False, na=False).any():
-                st.warning("Benchmark ei laadinud ära. Scan jooksis edasi NEUTRAL režiimis.")
+            if not selftest["ok"]:
+                st.error("Andmeallika enesetest kukkus läbi. Scan peatati.")
+            else:
+                if not signals.empty and signals["reason"].astype(str).str.contains("benchmark unavailable", case=False, na=False).any():
+                    st.warning("Benchmark ei laadinud ära. Scan jooksis edasi NEUTRAL režiimis.")
 
-            st.success(
-                f"Skänn tehtud. Turu režiim: {result['regime']}. "
-                f"Rangus: {get_strictness_label(signal_strictness)}. "
-                f"Teavitused: {result['notification_message']}"
-            )
+                st.success(
+                    f"Skänn tehtud. Turu režiim: {result['regime']}. "
+                    f"Rangus: {get_strictness_label(signal_strictness)}. "
+                    f"Teavitused: {result['notification_message']}"
+                )
         except Exception as exc:
             st.error(f"Skänn ebaõnnestus: {exc}")
+
+    render_selftest(selftest)
 
     if HISTORY_FILE.exists() and signals.empty:
         try:
